@@ -25,8 +25,8 @@ and ask the user what they use instead, rather than trying to reach them.
 - Test first for anything non-trivial. While you work, run the one test
   file or test you're on: `node --test test/unit/<name>.test.ts` in
   `runner/`, `swift test --filter <Tests>` in `app/`. Whole suites go
-  through `./check.sh`, which runs them on the check host (Tinker Desk for
-  Mike, `checkHost` in runner.json), not on his Mac: three threads' suites
+  through `./check.sh`, which runs them on a check host (Tinker Desk, or
+  the cloud box for a `--quick` run, `checkHosts` in runner.json), not on his Mac: three threads' suites
   at once took it to a load of 75, and a test window came up over his
   browser (6 Nov). A hook blocks `npm test` and `check.sh --local` here.
 - Changing a threadbear tool's arguments: keep taking the old ones. A resumed
@@ -86,6 +86,12 @@ and ask the user what they use instead, rather than trying to reach them.
   against a real dev runner and debug app, checks each step, and saves a
   shot of each; look at the shots too. The mock fakes patches and trust,
   and tours that passed on it were broken on a real install (30 Oct).
+- A UI idea that moves or is felt (an animation, a drag, a gesture,
+  "juice"): before building it, mock it and show Mike a short clip of it
+  in motion, through show_options when there's more than one. A list of
+  ideas in words isn't enough. He had to ask for this on 3 Nov ("show me
+  some options visually") and twice on 7 Nov ("mock these up and show me
+  a video", "can you mock it out first?").
 - Building a design Mike picked (show_options): before landing, put a
   shot of the build beside the mockup he picked and check the layout
   matches, not just the wording. The done card shipped as a card in the
@@ -97,6 +103,25 @@ and ask the user what they use instead, rather than trying to reach them.
   stepped from a display link showed Mike a couple of frames, as the
   same click opens the next thread (30 Oct). The perf run
   (`app/Tools/perf-run.sh`) times archiving too.
+- On Mike's Hetzner Cloud runner (and sandboxes to come), git pushes with a
+  one-hour token his main Mac hands over (`~/dev/me/misc/github-app` there),
+  and the repo's rulesets let it write only `cloud/**` branches: push your
+  work as `cloud/<topic>` and say so. `main`, other branches and tags are
+  refused; landing happens from the main Mac.
+- Assume every action is slow to land. Another runner's thread goes
+  through Convex and that runner taking the command (a second or more),
+  and the main Mac's runner can be busy. Anything Mike clicks either shows
+  the result straight away (an optimistic update the real answer then
+  confirms or rolls back, with the error) or shows a spinner and stops
+  taking clicks until it lands. Never leave a button that looks idle and
+  can be clicked twice. Mike, 6 Nov, after Start it on a cloud thread's
+  card sat for a second with nothing happening. The pieces:
+  `whileBusy(BusyKey...)` and `isBusy` (`AppModel+Busy.swift`) with `.busy(_:)`
+  on the control, `note:` for a click from a menu (it shows in the banner),
+  a guess with rollback like `update` and `updateProject`, and in the
+  transcript `ThreadSession.answering` with `Spinner` in Cells.swift.
+  `EveryClickShowsTests` fails on a new call that changes something on the
+  runner until you've done that and listed where it shows.
 - Every control gets a tooltip, with `.tip("…")` (SwiftUI) or `setTip` (AppKit).
   `.help` and `toolTip` never show in this app; TipsTests fails on them.
 - Transcript files and fixtures made from real sessions are private: keep them
@@ -123,8 +148,9 @@ and ask the user what they use instead, rather than trying to reach them.
   A panel with an `items` function is a native list (rows, no page to
   serve); `.threadbear/patches/checks.ts` has one, Worktrees. Write
   patch files with Edit or Write, not the shell: the runner trusts what
-  an agent's Edit and Write calls leave, and makes Mike trust anything
-  else before it runs (docs/protocol.md, "Trusting a folder's patches").
+  a Full access thread's Edit and Write calls leave in its own folder,
+  and makes Mike trust anything else before it runs (docs/protocol.md,
+  "Trusting a folder's patches").
 - After landing a change to the Mac app, don't ask Mike to Restart to
   Update or to check it for you: the app restarts onto the new build by
   itself once he leaves it idle. Call `wait_for_app_restart` with what to
@@ -157,6 +183,14 @@ For the real thing, use Tinker Desk's desktop from a throwaway copy, through
 scripted drag does start from a window of your own. It doesn't start from a
 screenshot's floating thumbnail, so that one still takes a person.
 
+Trackpad gestures are the same. Made-up events handed to a handler never meet a
+scroll view, and a scroll view that gets any of a gesture takes the rest itself,
+so swipes passed every test here and failed on Mike's trackpad twice (7 Nov).
+`app/Tools/post-gesture.swift` sends them through the window server. Someone
+else may be using that desktop: first check nothing's recording it
+(`pgrep -fl ffmpeg`) and that your window really is in front (`front`, then a
+look at the screen). Wake its screen with `caffeinate -u`, or the events go nowhere.
+
 ## Other people's PRs
 
 The repo's public, so people send fixes. Before starting on a GitHub issue, run
@@ -166,28 +200,41 @@ fix (6 Nov). Their hand test may know more than you can find out. Merge with
 `gh pr merge --rebase` so it shows as merged and stays theirs, and put anything
 of your own in a commit on top. A comment to them goes past Mike first.
 
+A commit on someone's fork isn't an offer, however good it looks: they haven't
+asked for it to go anywhere. Don't suggest bringing one in, and don't take one,
+unless Mike asks for that one by name or they've opened a PR. Mike, 6 Nov: "I
+don't think you should be pulling in anybody's stuff willy nilly." Telling him
+what people have built is fine, and that's all the fork watch schedule does.
+
 ## Experiments
 
 Other people run Threadbear since the repo went public (5 Nov 2026), so a
 new feature Mike is still trying out lands as an experiment: off by
 default, on for him (Mike asked 6 Nov).
 
-- Add it to `EXPERIMENTS` in `runner/src/experiments.ts` (id, title,
-  `added` date, `on: false`) and check `experimentOn(home, id)` where it
-  starts. Put `"experiments": { "<id>": true }` in Mike's `runner.json`
-  (`~/Library/Application Support/Threadbear/runner.json`) so it's on
-  for him.
+- Give it a file of its own, `runner/src/experiments/<id>.md` (copy
+  one that's there): its id, name, title, `added` date, `on: false` and
+  `reminder`, then what it does (for the guide), where it lives and how
+  to take it out (for forks). Check `experimentOn(home, '<id>')` where
+  it starts. Put `"experiments": { "<id>": true }` in Mike's
+  `runner.json` (`~/Library/Application Support/Threadbear/runner.json`)
+  so it's on for him.
+- Run `npm run experiment-docs` in `runner/` and commit
+  `docs/experiments.md` with it: the guide and the forking table point
+  there, and `experiment-docs.test.ts` fails while it's out of date. Edit
+  the experiment's file, never the generated doc. One file each and a
+  union merge on the doc mean two threads adding experiments at once
+  don't collide when they land.
 - Book the check-in when it lands: `schedule_message` with `new_thread`
   in this repo, about four days out, telling that thread to look at how
   the experiment has gone and ask Mike whether to turn it on for
-  everyone, keep trying it, or take it out. Its id is the entry's
+  everyone, keep trying it, or take it out. Its id is the file's
   `reminder`; `experiments.test.ts` fails without one.
-- Say it in `docs/guide.md` ("Experiments") and in the forking table.
 - When Mike says to make it standard, take the flag out entirely: its
-  entry in `experiments.ts`, the `experimentOn` check, its key in his
-  runner.json files (the M5, `ssh bruce`, `ssh cloud`), and its place
-  in the guide's "Experiments" section (its text moves to where the
-  feature belongs). Don't leave a default-on switch behind: every flag
+  file, the `experimentOn` check, its key in his runner.json files (the
+  M5, `ssh bruce`, `ssh cloud`), then `npm run experiment-docs`. Its
+  "What it does" text moves to where the feature belongs in the guide.
+  Don't leave a default-on switch behind: every flag
   left in is another path through the code to keep working. If people
   might really want it off, make it a normal setting instead. When he
   says take it out, delete the feature with its flag.
@@ -211,7 +258,10 @@ if `tb` isn't found (an older runner, or outside a thread), use
   change outside `runner/`). With a check host set it copies the checkout
   there, runs it, brings back failed steps' logs and deletes the copy
   (`scripts/check-remote.sh`); one run at a time, so it may say it's
-  waiting for another thread's. If the host can't be reached it runs here
+  waiting for another thread's. A host short of disk is passed over (8 GiB
+  free for Swift, 2 otherwise), and if none has room the check fails and
+  names them. A host that stops answering partway is dropped for the next
+  one. If none can be reached it runs here
   at low priority. `--e2e` always runs here, as it needs the claude login. It skips the deploy tests and BearDock's
   unless something they cover changed from main (`--all` runs them
   anyway). The app's part is under a minute with a warm `app/.build` and
@@ -240,10 +290,13 @@ if `tb` isn't found (an older runner, or outside a thread), use
 - A thread started somewhere else (like `~/dev/me/misc`) still needs a
   worktree of its own, as another thread may be editing the main
   checkout. Borrow a spare: `./borrow-worktree.sh` in the main checkout
-  prints one, detached at main and set up, with warm build caches. Don't
-  `git worktree add` a fresh one: its first app build takes 5 to 10
-  minutes. Commit there, merge to main yourself, then
+  prints one, on a `thread/borrow-<slot>-<time>` branch from main, set
+  up, with warm build caches. Don't `git worktree add` a fresh one: its
+  first app build takes 5 to 10 minutes. Commit there and run `tb land`
+  in it (`runner/bin/tb` if `tb` isn't found), then
   `./borrow-worktree.sh --give-back <dir>` so the next thread gets it.
+  Landing any other way holds `tb land`'s lock throughout
+  (docs/thread-worktrees.md); a plain `git merge` wastes queued checks.
 - The live runner runs a release, a snapshot, so editing `runner/` doesn't
   change it. To try a runner change, start `runner/scripts/dev-runner.sh` in
   the background and use the `<dev home>/tb` it prints (a bare `tb` reaches

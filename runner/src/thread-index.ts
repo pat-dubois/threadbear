@@ -41,7 +41,9 @@ export type IndexRow = {
 // What the Mac app gets (docs/protocol.md, "Other runners' threads").
 export type RemoteRunner = { id: string; name: string; icon?: string; online: boolean; lastSeenAt: string; rpcUrl?: string; tokenFile?: string };
 export type RemoteThread = IndexRow & { runnerId: string };
-export type RemoteThreads = { runners: RemoteRunner[]; threads: RemoteThread[] };
+// `order`: Mike's runner order (backend API 58), every runner's id, this
+// one's too, for the app's Settings > Runners. Left out before it's heard.
+export type RemoteThreads = { runners: RemoteRunner[]; threads: RemoteThread[]; order?: string[] };
 
 type RawRunner = { runnerId: string; name: string; icon?: string; lastSeenAt: number; rpcUrl?: string };
 type SinceRow = RemoteThread & { updatedMs?: number; deleted?: boolean };
@@ -120,14 +122,18 @@ export class ThreadIndex {
     // Whether the backend can answer with only the rows changed since the
     // last answer (API 29). Without it, every re-run reads every row.
     takesSince?: () => boolean;
+    // Whether the backend has the runner order for the main key (API 58).
+    takesOrder?: () => boolean;
     // Whether a Mac app is connected to this runner. Only an app shows the
     // other runners' threads, so with none there's nothing to watch them
     // for. Left out, they're always watched.
     appConnected?: () => boolean;
     // What was sent before the runner last stopped (sync-cache.ts): a start
     // then writes only what changed, and doesn't read every row to prune.
-    seed?: () => { at: number; rows: Record<string, string>; removed?: string[] } | undefined;
+    seed?: () => { at: number; rows: Record<string, string>; removed?: string[]; archived?: boolean } | undefined;
     onSent?: () => void;
+    // A thread finishing on the release that handed over (sync.ts SyncDeps).
+    elsewhere?: (threadId: string) => boolean;
   };
   private running = false;
   private sent = new Map<string, string>(); // threadId -> writeKey as sent
@@ -141,6 +147,13 @@ export class ThreadIndex {
   private unlisten?: () => void;
   private unsubscribe?: () => void;
   private remote: RemoteThreads = { runners: [], threads: [] };
+  // Mike's runner order, watched with the other runners (API 58).
+  private order?: string[];
+  private unsubOrder?: () => void;
+  // A backend before API 54 dropped a runner key's archived rows while this
+  // remembered them as sent: they go once more, then this says so (snapshot).
+  private archivedSent = false;
+  private archivedWanted = false;
   // The backend said this runner's key can't read other runners' threads.
   private refused = false;
   // Whether the list has had the backend's answer since the watch started
@@ -171,9 +184,18 @@ export class ThreadIndex {
     if (seed) {
       this.sent = new Map(Object.entries(seed.rows));
       this.fullAt = seed.at;
+      this.archivedSent = seed.archived === true;
       this.full = false;
       const here = new Set(this.deps.host.list(['inbox', 'snoozed', 'archived']).map((t) => t.id));
       for (const id of seed.removed ?? []) if (!here.has(id)) this.removed.add(id);
+      // One the file says is up whose thread isn't here (nor finishing on the
+      // release before): deleted while sync wasn't listening. A start from the
+      // file has no full write to drop it. Written again if it turns up.
+      for (const id of [...this.sent.keys()]) {
+        if (here.has(id) || this.deps.elsewhere?.(id)) continue;
+        this.sent.delete(id);
+        this.removed.add(id);
+      }
     }
     for (const t of this.deps.host.list(['inbox', 'snoozed', 'archived'])) this.mark(t);
     this.unlisten = this.deps.host.onNotification((n) => {
@@ -186,6 +208,10 @@ export class ThreadIndex {
       } else return;
       this.schedule();
     });
+    if (this.archivedWanted) {
+      this.archivedWanted = false;
+      this.resendArchived();
+    }
     this.schedule(0);
     this.appGoneAt = undefined;
     if (this.deps.appConnected) this.checkWatch();
@@ -229,6 +255,7 @@ export class ThreadIndex {
     // What was heard before may be old by now: the tools wait for this watch's answer.
     this.answered = false;
     const failed = (e: Error) => this.watchFailed(e);
+    this.watchOrder();
     this.watchingSince = this.deps.takesSince?.() ?? false;
     if (this.watchingSince) {
       // A heartbeat re-runs only this small read; the rows are watched
@@ -249,12 +276,30 @@ export class ThreadIndex {
   private unwatch(): void {
     this.unsubscribe?.();
     this.unsubscribe = undefined;
+    this.unsubOrder?.();
+    this.unsubOrder = undefined;
     this.unsubRows?.();
     this.unsubRows = undefined;
     this.rowsKey = undefined;
     this.since.clear();
     this.rows.clear();
     this.runnersHeard = [];
+  }
+
+  // One small row, re-run only when Mike moves a runner. A failure leaves
+  // the app's list in the order it had, so it's only logged.
+  private watchOrder(): void {
+    if (this.unsubOrder || !this.deps.subscribe || !this.deps.takesOrder?.()) return;
+    this.unsubOrder = this.deps.subscribe(
+      'sync:runnerOrder',
+      { key: this.deps.key },
+      (v) => {
+        this.order = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+        this.remote = { ...this.remote, order: this.order };
+        this.deps.publish?.({ method: 'remoteThreads.updated', params: this.withTokens(this.remote) });
+      },
+      (e) => this.deps.log.warn('the runner order subscription failed', { error: String(e) }),
+    );
   }
 
   private onRunners(v: unknown): void {
@@ -351,9 +396,9 @@ export class ThreadIndex {
   }
 
   /** For sync-cache.ts: undefined until a full write has finished. */
-  snapshot(): { at: number; rows: Record<string, string>; removed?: string[] } | undefined {
+  snapshot(): { at: number; rows: Record<string, string>; removed?: string[]; archived?: boolean } | undefined {
     if (this.full || !this.fullAt) return undefined;
-    return { at: this.fullAt, rows: Object.fromEntries(this.sent), ...(this.removed.size || this.removing.length ? { removed: [...new Set([...this.removed, ...this.removing])] } : {}) };
+    return { at: this.fullAt, rows: Object.fromEntries(this.sent), ...(this.archivedSent ? { archived: true } : {}), ...(this.removed.size || this.removing.length ? { removed: [...new Set([...this.removed, ...this.removing])] } : {}) };
   }
 
   /** The deployment doesn't know this runner: everything goes again. */
@@ -366,6 +411,26 @@ export class ThreadIndex {
   }
 
   /** The backend got new enough for what rows held back: they go again. */
+  /** Once a backend keeps a runner key's archived rows (API 54): those it dropped go again, once. */
+  resendArchived(): void {
+    if (this.archivedSent) return;
+    // Heard before the index has started (the heartbeat comes first): at start.
+    if (!this.running) {
+      this.archivedWanted = true;
+      return;
+    }
+    this.archivedSent = true;
+    let n = 0;
+    for (const t of this.deps.host.list(['archived'])) {
+      if (!t.archivedAt) continue;
+      this.sent.delete(t.id);
+      this.mark(t);
+      n++;
+    }
+    if (n) this.deps.log.info('thread index: sending archived threads again', { threads: n });
+    this.schedule();
+  }
+
   refresh(): void {
     if (!this.running) return;
     // Now able to watch only what changed: start the watch over that way.
@@ -373,6 +438,8 @@ export class ThreadIndex {
       this.unwatch();
       this.watch();
     }
+    // The backend's taken the runner order since the watch began.
+    if (this.unsubscribe) this.watchOrder();
     for (const t of this.deps.host.list(['inbox', 'snoozed', 'archived'])) this.mark(t);
     this.schedule();
   }
@@ -455,6 +522,7 @@ export class ThreadIndex {
           ...(r.rpcUrl ? { rpcUrl: r.rpcUrl } : {}),
         })),
       threads: value?.threads ?? [],
+      ...(this.order ? { order: this.order } : {}),
     };
     this.deps.publish?.({ method: 'remoteThreads.updated', params: this.withTokens(this.remote) });
   }
@@ -462,6 +530,7 @@ export class ThreadIndex {
   // The token file is named only when it's there: no file, no way in.
   private withTokens(r: RemoteThreads): RemoteThreads {
     return {
+      ...r,
       threads: r.threads,
       runners: r.runners.map((x) => {
         const file = runnerTokenFile(this.deps.home, x.id);

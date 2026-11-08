@@ -24,6 +24,7 @@ import type { ThreadRecord } from '../store.ts';
 import { experimentOn } from '../experiments.ts';
 import { pickInPool, poolAccounts, poolForFolder } from '../pools.ts';
 import { providerName } from '../runner.ts';
+import { cutSafely, safeEnd } from '../safe-cut.ts';
 
 export const LAB_REVIEW_ROUNDS = 2;
 // Fewer changed lines of code than this (docs and plain text don't count)
@@ -46,13 +47,27 @@ export const labReviewPart = {
   // Called once a turn has finished with nothing needed and nothing left
   // running. Starts the review and returns its thread id (the caller then
   // waits on it), or undefined when there's none to do.
-  startLabReview(this: Runner, st: ThreadState, turnId: string, reply: string | undefined): string | undefined {
+  startLabReview(this: Runner, st: ThreadState, turnId: string, reply: string | undefined, upTo?: number): string | undefined {
     const { rec } = st;
-    if (this.stopping || rec.reviewOf || rec.archivedAt) return undefined;
+    if (rec.reviewOf || rec.archivedAt) return undefined;
     if (!experimentOn(this.cfg.home, 'labReview')) return undefined;
     if ((rec.labReviews ?? 0) >= LAB_REVIEW_ROUNDS) return undefined;
-    const change = this.turnChange(st, turnId);
+    const change = this.turnChange(st, turnId, upTo);
     if (!change || change.codeLines < LAB_REVIEW_MIN_LINES) return undefined;
+    // A runner handing over to a new release, restarting or stopping
+    // makes no threads (new-threads.ts), and the turn that just ended is
+    // often the one that landed the release (THREADBEAR-14, 6 Nov 2026).
+    // The review is owed instead, and the runner that has the thread next
+    // starts it (startOwedReview). The caller doesn't mark it finished
+    // meanwhile.
+    if (this.draining || this.refusing || this.stopping) {
+      // Where its events end, so a long turn in between can't push them
+      // out of turnChange's reach.
+      rec.labReviewOwed = { turnId, seq: upTo ?? rec.lastSeq ?? 0, ...(reply ? { reply } : {}) };
+      this.markDirty(st);
+      this.log.info('lab review owed to the next runner', { threadId: rec.id });
+      return undefined;
+    }
     const login = this.reviewLogin(rec);
     if (!login) {
       this.emit(st, { type: 'system.note', text: 'Not reviewed: there is no other login on this runner to review the change with.' });
@@ -77,7 +92,7 @@ export const labReviewPart = {
         // Full, as before; an Ask or Auto one asks or checks the same way.
         // Anything else (a record from before modes) gets Ask.
         permissionMode: reviewMode(rec.permissionMode),
-        title: `Review: ${rec.title}`.slice(0, 120),
+        title: cutSafely(`Review: ${rec.title}`, 120),
         // The same checkout, as it is now, not a worktree of its own.
         worktree: false,
         startedBy: { kind: 'thread', label: 'Review', threadId: rec.id, threadTitle: rec.title, why: 'checks a change before it is called done' },
@@ -104,10 +119,49 @@ export const labReviewPart = {
     return threadId;
   },
 
+  // Reviews the last runner owed (startLabReview), once they're here: for
+  // one thread as it's adopted from a draining runner, or every thread
+  // once a runner that has just started is listening (main.ts). After the
+  // restart's own resume of that thread, which a review would turn away by
+  // putting it to sleep, and never during start(): a CLI's tools need what
+  // main.ts sets up after it, so not while it holds waits for that
+  // either: a thread adopted while it's starting gets its review from the
+  // call once it's listening.
+  startOwedReviews(this: Runner, threadId?: string): void {
+    if (this.holdWaits) return;
+    for (const st of threadId ? [this.threads.get(threadId)] : [...this.threads.values()]) if (st?.rec.labReviewOwed) this.startOwedReview(st);
+  },
+
+  startOwedReview(this: Runner, st: ThreadState): void {
+    const { rec, rt } = st;
+    const owed = rec.labReviewOwed;
+    if (!owed || rt.deleted) return;
+    // Busy (a resume, a queued message): the next turn to complete settles
+    // it (completeTurn).
+    if (rt.turn || rec.queue.length) return;
+    if (rec.archivedAt) {
+      delete rec.labReviewOwed;
+      this.markDirty(st);
+      return;
+    }
+    // Put to sleep since (by Mike or a schedule while the handover
+    // waited): a review would wake it early, so its next turn to complete
+    // settles it. Not marked finished meanwhile, as it hasn't been
+    // reviewed.
+    if (this.bucket(rec) === 'snoozed') return;
+    delete rec.labReviewOwed;
+    this.markDirty(st);
+    const review = this.startLabReview(st, owed.turnId, owed.reply, owed.seq);
+    if (review) this.waitOnReview(st, review);
+    // Owed again if this runner is handing over too.
+    else if (!rec.labReviewOwed) this.markFinished(st, owed.reply);
+  },
+
   // What the turn changed, from its edit.diff events (the CLI's own edits;
   // a file changed by a shell command isn't seen).
-  turnChange(this: Runner, st: ThreadState, turnId: string): TurnChange | undefined {
-    const last = st.rec.lastSeq ?? 0;
+  // `upTo`: where the turn's events end, for one owed from earlier.
+  turnChange(this: Runner, st: ThreadState, turnId: string, upTo?: number): TurnChange | undefined {
+    const last = upTo ?? st.rec.lastSeq ?? 0;
     let events;
     try {
       events = this.store.log(st.rec.id).read(Math.max(1, last - LOOK_BACK), last);
@@ -200,7 +254,7 @@ export function reviewMode(mode: PermissionMode | undefined): PermissionMode {
 
 function clip(text: string, max: number): string {
   const t = text.trim();
-  return t.length > max ? t.slice(0, max) + '…' : t;
+  return t.length > max ? t.slice(0, safeEnd(t, max)) + '…' : t;
 }
 
 // One line, quoted, for a title or path an agent chose: no line breaks
