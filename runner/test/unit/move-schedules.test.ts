@@ -398,7 +398,9 @@ test("a moved worktree that changes what trust covers is held to the stored hash
 
 test("an older runner's staged worktree loses untracked packages at adopt, and a linked node_modules is left alone", async () => {
   const repo = fs.realpathSync(tmpDir('tb-move-pkgs-'));
-  const g = (...a: string[]) => execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { encoding: 'utf8' }).trim();
+  // core.excludesFile: a global gitignore with node_modules/ in it would keep
+  // committed/node_modules out of the commit.
+  const g = (...a: string[]) => execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'core.excludesFile=/dev/null', ...a], { encoding: 'utf8' }).trim();
   g('init', '-q');
   fs.writeFileSync(path.join(repo, 'a.txt'), 'a\n');
   fs.mkdirSync(path.join(repo, 'committed', 'node_modules', 'c'), { recursive: true });
