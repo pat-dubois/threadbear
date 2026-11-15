@@ -8,12 +8,15 @@ new ones, and threads still get both, for skills written before.
 
 Threadbear is Mike's own agent app: a TypeScript runner daemon (`runner/`)
 that drives the official Claude Code (and later Codex) CLIs, and a native
-SwiftUI + AppKit Mac app (`app/`) that talks to it over the protocol in
-`docs/protocol.md`. Read `docs/plan.md` and `docs/protocol.md` before changing
+desktop app that talks to it over the protocol in `docs/protocol.md`: the GPUI
+one in `desktop/`, which replaces the frozen SwiftUI one in `app/` (see "The
+GPUI port"). Read `docs/plan.md` and `docs/protocol.md` before changing
 anything. The Convex mirror, the iPhone app (`ios/`) and the website (`web/`)
 are in `docs/convex-backend.md` and `docs/website.md`. The public landing
 page (threadbear.mikecann.app) is `site/`, a separate
 static site with its own `package.json`; its comments say how to build it.
+Its What's new page (`/changelog`) gets an entry per release, with pictures:
+`docs/changelog.md`.
 
 This file is written for Mike's own copy. The machines it names (the M5,
 `bruce`, `cloud`, `tinker-desk`) and paths under `~/dev/me` are his: in
@@ -29,6 +32,12 @@ and ask the user what they use instead, rather than trying to reach them.
   the cloud box for a `--quick` run, `checkHosts` in runner.json), not on his Mac: three threads' suites
   at once took it to a load of 75, and a test window came up over his
   browser (6 Nov). A hook blocks `npm test` and `check.sh --local` here.
+- Builds on Mike's Mac go one at a time: `scripts/one-build.sh <command>`
+  holds a lock for the machine while it runs (three threads' app and iPhone
+  builds at once, 9 Nov). The build scripts (build-app.sh, dev-app.sh,
+  sim-shots.sh, install-phone.sh) take it themselves, and his hook puts a
+  bare `swift build`/`swift test`/`xcodebuild` through it; a build that says
+  it's waiting for another is that, so give it a longer timeout.
 - Changing a threadbear tool's arguments: keep taking the old ones. A resumed
   Claude session keeps a tool's definition from when it first loaded it, and
   ToolSearch shows that one too, so it goes on calling the old form
@@ -43,6 +52,26 @@ and ask the user what they use instead, rather than trying to reach them.
   shorter or go behind something agents look up.
 - The protocol is the contract. Change `docs/protocol.md` first, then both
   sides, and keep both sides tolerant of unknown fields and event types.
+- A thread is reached four ways: this runner's own threads, another
+  runner's through Convex (`runner/src/relay.ts`), and the iPhone and the
+  website through Convex (`convex/phone.ts`). Pictures, a card's notes and
+  send_message each worked on the first and went missing on the others
+  (8 Nov). A new thread request needs a row in `runner/src/parity.ts`
+  saying where it works (`parity.test.ts` fails without one, and checks
+  each yes against the code; `npm run parity-docs` remakes
+  `docs/parity.md`). A change to what a thread shows (a card's field, a
+  message's content, the done card) gets a scenario in
+  `runner/test/unit/scenarios.test.ts`: it plays the thread on this
+  runner, writes it through the real backend functions, and checks
+  another Mac and the phone see the same, or a difference listed there
+  with why. The backend tests' fake Convex checks the real schema and
+  validators, so a field Convex would refuse fails there too.
+  Nightly, `scripts/parity/nightly.sh` plays the same scenarios into a
+  throwaway backend on Tinker Desk and has the real website, iPhone app
+  and GPUI Mac app read them, with a picture of each side by side in
+  `~/Library/Caches/Threadbear/parity/<time>/index.html` (its first run
+  found the website and the iPhone drawing cards without their notes).
+  A scenario's `shows` are the words each surface must show.
 - Only ever spawn the official `claude` (and later `codex`) binaries under
   Mike's own logins. Never read or copy OAuth tokens or Keychain credentials.
 - Tests that hit a real model use the cheapest model, tiny prompts, a temp
@@ -62,7 +91,9 @@ and ask the user what they use instead, rather than trying to reach them.
   data fix) gets an `Important: <why, in a few plain words>` trailer. Their
   runners start a thread to bring in the release that has it straight away
   rather than on their 5-day timer (`runner/src/bring-in.ts`), and the why is
-  what they read. Use it rarely, or it stops meaning anything.
+  what they read. Use it rarely, or it stops meaning anything. Put it in the
+  message's last paragraph with Co-Authored-By, no blank line between: git
+  reads trailers only there, and `tb land` refuses it anywhere else.
 - `docs/guide.md` is the user guide, and every thread's agent is pointed at
   it (`guideLine` in `runner/src/threadbear-mcp.ts`). Keep it true when a
   change alters what someone using the app sees or does.
@@ -96,6 +127,15 @@ and ask the user what they use instead, rather than trying to reach them.
   shot of the build beside the mockup he picked and check the layout
   matches, not just the wording. The done card shipped as a card in the
   transcript when he'd picked one joined to the composer (30 Oct).
+- A feature Mike uses (a card, a button, a panel, a window, a tool that
+  shows him something): once it's live on his app, show it working
+  before you report it done. Make a real example he can try there and
+  then (a show_options with a clip in it, a small new thread that offers
+  the new button, a patch panel with sample rows), plus a clip or shot
+  in the reply. Don't end on "the first thread that uses it will be its
+  first outing". He had to ask "can you show me an example so I can try
+  it?" on 6, 9 and 10 Nov (a602647d, 7c4ec91c, 69683b5d), found by the
+  nightly retro.
 - Animations: hand anything longer than a hover fade to Core Animation
   (keyframes, `animator()`, SwiftUI's own animations), never step it from
   the main thread each frame, and before landing try it with the main
@@ -126,9 +166,10 @@ and ask the user what they use instead, rather than trying to reach them.
   `.help` and `toolTip` never show in this app; TipsTests fails on them.
 - Transcript files and fixtures made from real sessions are private: keep them
   out of git (`.fixtures/` is ignored).
-- Errors go to Sentry (project `threadbear`, tag `component` mac, runner or
-  ios) only from what Mike really runs: the installed release app
-  (`app/Sources/Threadbear/CrashReporting.swift`), the installed runner's
+- Errors go to Sentry (project `threadbear`, tag `component` mac, runner,
+  ios or desktop) only from what Mike really runs: the installed release app
+  (`app/Sources/Threadbear/CrashReporting.swift`), the installed GPUI app
+  (`desktop/gpui/src/crash_reporting.rs`), the installed runner's
   release on the real data dir (`runner/src/sentry.ts`) and App Store
   iPhone builds. Debug builds, dev runners, tests, sandboxes and scripted
   runs never report; keep it that way. `THREADBEAR_SENTRY=off` turns it off.
@@ -138,6 +179,9 @@ and ask the user what they use instead, rather than trying to reach them.
   (`HangWatch.swift`). Each stall of 4 seconds or more has a `sample` of the
   stuck main thread, and one of 15 or more reaches Sentry as "Main thread
   stuck in ...". Fix the frame it names rather than guessing from logs.
+  The GPUI app keeps its own in `hangs/desktop` there
+  (`desktop/gpui/src/hang_watch.rs`), and its panics in
+  `~/Library/Logs/Threadbear/crashes/desktop`.
 - Mike's own repo: work goes to main once tests pass. A thread started in
   this repo has a worktree of its own and lands with `tb land` (below).
   Anywhere several threads share a checkout (the main one, a worktree made
@@ -188,8 +232,29 @@ scroll view, and a scroll view that gets any of a gesture takes the rest itself,
 so swipes passed every test here and failed on Mike's trackpad twice (7 Nov).
 `app/Tools/post-gesture.swift` sends them through the window server. Someone
 else may be using that desktop: first check nothing's recording it
-(`pgrep -fl ffmpeg`) and that your window really is in front (`front`, then a
-look at the screen). Wake its screen with `caffeinate -u`, or the events go nowhere.
+(the `recording()` guard in `features/tools/real-screen.ts` checks executable
+names, including variants) and that your window really is in front (`front`,
+then a look at the screen). Wake its screen with `caffeinate -u`, or the events go nowhere.
+
+## The GPUI port
+
+The desktop app is being rewritten as one GPUI app for Mac, Windows and Linux
+(`docs/gpui-port.md`, `desktop/`). Mike uses it every day since 12 Nov, so the
+Swift app (`app/`, `dock/`) is frozen: changes go in `desktop/`, never in both.
+`scripts/swift-freeze.sh` refuses a Claude edit or a commit there in Mike's copy,
+and `check.sh` no longer builds or tests the Swift app unless it changed (or with
+`--app`). What the GPUI and iPhone apps still use from `app/` stays open (the mock
+runner, test tools, fixtures, art, the files ThreadbearKit links); the script's
+comment lists it, and says how to let a change through when Mike asks for one. In other
+people's copies it will only warn, from the release that gives them the GPUI app.
+A change to what the app does should get a spec in `features/` (Gherkin;
+`features/README.md`), so the two apps' differences stay visible in
+`docs/gpui-port/PARITY.md`. A change to how the transcript folds has to keep both
+languages' golden tests happy (`desktop/core/tests/golden`). Rust builds and spec
+runs go elsewhere: `desktop/scripts/remote.sh cloud -- <command>`, or
+`tinker-desk --desk` for a window on a real Mac. The installed GPUI app
+follows main as the Mac app does (`desktop/gpui/src/app_update.rs`, built on a
+check host), so `wait_for_app_restart` hears it restart onto a landed change.
 
 ## Other people's PRs
 
@@ -218,7 +283,10 @@ default, on for him (Mike asked 6 Nov).
   to take it out (for forks). Check `experimentOn(home, '<id>')` where
   it starts. Put `"experiments": { "<id>": true }` in Mike's
   `runner.json` (`~/Library/Application Support/Threadbear/runner.json`)
-  so it's on for him.
+  so it's on for him. Settings > General > Experiments lists it by
+  itself, with its name and "What it does" behind the ⓘ, so there's
+  nothing to add in the app for its switch (`settings.update`'s
+  `experiments`). Write its name and that text for the people flipping it.
 - Run `npm run experiment-docs` in `runner/` and commit
   `docs/experiments.md` with it: the guide and the forking table point
   there, and `experiment-docs.test.ts` fails while it's out of date. Edit
@@ -254,7 +322,10 @@ if `tb` isn't found (an older runner, or outside a thread), use
 `runner/bin/tb`. `tb --help` lists the rest.
 
 - `./check.sh` runs every check (`--quick`: the runner's typecheck and
-  unit tests, about a minute; `--app`: the app's build and tests, for a
+  unit tests, about a minute, the Mac app's release build when `app/`
+  or `dock/` changed, and the GPUI port's core and client tests and a
+  `cargo check` of the GPUI app when `desktop/` changed, with the full run adding a `cargo check` of the
+  whole workspace; `--app`: the app's build and tests, for a
   change outside `runner/`). With a check host set it copies the checkout
   there, runs it, brings back failed steps' logs and deletes the copy
   (`scripts/check-remote.sh`); one run at a time, so it may say it's
@@ -277,10 +348,24 @@ if `tb` isn't found (an older runner, or outside a thread), use
   reused with its Swift build caches so the app builds warm. Your system prompt says where. Commit there. When
   the work is done and checked, `tb land` rebases it on main, runs
   `./check.sh --quick` and fast-forwards main in the main checkout
-  (`--dry-run` first if you like; it never pushes). Mike's Land chip does
+  (`--dry-run` first if you like; it never pushes). Landings waiting
+  for the lock are checked together in the next check, and a failed
+  group is halved until the one that broke it is found
+  (docs/thread-worktrees.md, "Landing together"), so run it in the
+  background and expect up to two checks' wait. Mike's Land chip does
   the same. If it refuses, it says why and what to fix: commit your
   changes, sort out the conflicting files, fix the check, or wait for
-  whoever has uncommitted changes in main's checkout. You can carry on
+  whoever has uncommitted changes in main's checkout. It also holds a
+  landing that changes what the Desktop app workflow checks (desktop/,
+  features/ and its other paths) while that workflow's last run on main
+  failed on GitHub, naming the run and what failed: the quick check can't
+  see what only GitHub's Macs, Linux and Windows do (red for two days of
+  GPUI landings, 10 to 12 Nov). Fix that red first; `tb land
+  --despite-red` is for the landing that's the fix
+  (docs/thread-worktrees.md, "Red on GitHub"). To bring GitHub's main
+  into this Mac's, or push it, run `scripts/sync-main.sh`: a main only
+  ahead of GitHub's is pushed at once, and otherwise it holds the landing
+  lock and checks a rebased combination before main moves (docs/thread-worktrees.md, "Syncing main with GitHub"). You can carry on
   after landing; the next `tb land` lands only what's new. Changing a
   `package.json`? Replace the link first: `rm runner/node_modules` (no
   trailing slash, so only the link goes), then `npm ci` there. When the
@@ -303,6 +388,9 @@ if `tb` isn't found (an older runner, or outside a thread), use
   the live runner unless `THREADBEAR_HOME` is set in that same command).
   Its threads start in `<dev home>/work` on claude-main (or
   `TB_E2E_ACCOUNT`) and claude-haiku-5-5 (its `runner.json` defaults), from `tb` or a debug app's composer alike.
+  For real-sized data use `--clone-real`, never `--home` on a copy of the
+  real data dir: a copy's threads are Mike's real sessions and folders
+  (docs/dev-tools.md, section 4).
   Leave `--home` out, or keep it and any extra work folders under
   `$TMPDIR`: Agent Archive skips transcripts from there, but not from
   `/tmp`, so a try-out thread in `/tmp` ends up in Mike's archive.
@@ -342,9 +430,11 @@ if `tb` isn't found (an older runner, or outside a thread), use
 - The LaunchAgent's program is `~/Applications/Threadbear Runner.app`
   (`runner/launcher/`), a small app that runs `node launch.mjs` so macOS's
   privacy prompts say "Threadbear Runner", not "node". Releases never
-  rebuild it: a change under `runner/launcher/` only ships when Mike runs
-  `install-runner.sh` from a terminal. `tb status` and the app's Updates
-  panel tell him once it's on main, but say so in your end_turn too.
+  rebuild it: a change under `runner/launcher/` only ships through a
+  reinstall. Once it's on main the Updates panel offers Update it, which
+  stages it to take over at Mike's next login (with the `selfReinstall`
+  experiment the runner does that by itself, `runner/src/reinstall.ts`);
+  say so in your end_turn too.
 - Never pass `--now`, run `install-runner.sh`, `tb restart` the live runner,
   `launchctl kickstart` it or stop its node process: each ends your own turn
   and stops other threads' work. If one is needed, finish and tell Mike the
@@ -387,23 +477,29 @@ if `tb` isn't found (an older runner, or outside a thread), use
 
 ## Seeing and driving the app
 
-`app/Tools/dev-app.sh` runs a debug build in a temp bundle, against the
-mock runner or a dev runner, with its window kept behind Mike's. Never use
-`~/Applications/Threadbear.app` for this. Instances belong to the thread
-and checkout that started them: without `--id`, a command means your
-newest one, never another thread's, and `stop --all` stops only yours.
-`start` prints the id; pass `--id` to every command once you have more
-than one, and use `status` to see whose is whose.
+`desktop/scripts/dev-app.sh` runs a debug GPUI build with the scripted
+control, against the mock runner or a dev runner, headless: out of the Dock,
+its windows transparent and letting clicks through, still drawing for `dump`
+and `shot`, and named "Threadbear Headless Tester" in ps (`--visible` puts
+it on screen, labelled, for a test that needs that; `--help` for the rest). It builds on an
+`updateBuildHosts` Mac and brings the binary back, or here through
+one-build.sh if none answers. The app refuses the real data folder and live
+runner (`--live` only if Mike says), and copies to a pasteboard of its own.
+Instances belong to the thread and checkout that started them: without
+`--id`, a command means your newest one, never another thread's, and
+`stop --all` stops only yours; `status` says whose is whose. An instance
+quits after an hour with no command. `app/Tools/dev-app.sh` is the same for
+the frozen Swift app.
 
-- A UI change: `app/Tools/dev-app.sh start --mock` (the demo threads; add
-  `--appearance light` for the other look), then drive it with
-  `do '{"cmd":"open","id":"demo_upload"}' '{"cmd":"expand","row":"g:"}'`,
-  read it with `dump` (rows with ids, kinds and heights, the composer and
-  what a send would run on, the banner) and look at it with
-  `shot <file.png>`. After an edit, `rebuild` restarts it on the new build
-  with the same thread open. Look at the images before saying it works,
-  then `stop`. An instance quits after an hour with no command. The
-  commands are in `app/README.md` ("Seeing and driving it from a script").
+- A UI change: `desktop/scripts/dev-app.sh start --mock` (the demo threads;
+  `--appearance dark` for pictures), then drive it with
+  `do '{"cmd":"open","id":"demo_upload"}' '{"cmd":"waitFor","loaded":true}'`
+  (`click-at` with `x`, `y` for what has no label), read it with `dump`
+  and look at it with `shot <file.png>`. After an edit, `rebuild` restarts
+  it on the new build with the same thread open. Look at the images before
+  saying it works, then `stop`. The commands are in `app/README.md`
+  ("Seeing and driving it from a script") and
+  `desktop/gpui/src/automation.rs`.
 - A cursor bug only shows with the real pointer: unit tests, `dump` and
   `shot` can't see it, and two fixes for the done card's "?" passed them
   and changed nothing Mike could see. Read `NSCursor.currentSystem` from a
@@ -415,14 +511,11 @@ than one, and use `status` to see whose is whose.
   moving: a tip coming up makes AppKit work the cursor out again, and
   SwiftUI's view behind AppKit content answers with the arrow. Run it with
   the fix taken out too, to see it fail.
-- `shot` runs screencapture from your shell. If it says the image was drawn
-  in-process (the screen is locked, or your shell has no Screen Recording
-  permission), the sidebar's glass is a flat fill; the rest is right.
 - A scripted app is never in front, so opening a thread doesn't mark it
   read until you send `{"cmd":"focus"}`.
 - A bug in one of Mike's real threads: `tb export <id>`, then
-  `app/Tools/dev-app.sh start --mock --fixtures app/.fixtures/threads/<id>`
-  and `open` it. Exports are his private conversations: keep shots of them
+  `dev-app.sh start --mock --fixtures app/.fixtures/threads/<id>` and
+  `open` it. Exports are his private conversations: keep shots of them
   out of git and delete them when done.
 - A runner change seen in the app: start `runner/scripts/dev-runner.sh`,
   then `dev-app.sh start --home <dev home>` (it prints that line). A

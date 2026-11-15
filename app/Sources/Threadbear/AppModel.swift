@@ -77,6 +77,14 @@ struct AskPicks: Equatable {
     var notes: [Int: AskNote] = [:]
 }
 
+/// An answer sent from a decision card on the Projects page (the
+/// projectDecisions experiment), while it's on its way: which card it
+/// answered, and what was picked, for the card's "Sending to" line.
+struct DecisionSend: Equatable {
+    var asksSeq: Int
+    var answers: [String]
+}
+
 /// The follow-ups ticked on a thread's done card, and which card they're for.
 struct NextPicks: Equatable {
     var seq: Int
@@ -126,6 +134,12 @@ final class AppModel {
     /// What the runner said about a thread archived elsewhere, held back
     /// while its row slides off, so the row's still there to slide.
     @ObservationIgnored var heldWhileSliding: [String: ThreadSummary] = [:]
+    /// Threads archived here that are already out of the list while the
+    /// runner's answer is on its way (`archive`). A summary that arrives
+    /// before the runner has it still says not archived; `threads`' didSet
+    /// keeps the guess, and leaves the thread's Terminal shell running till
+    /// the runner says yes.
+    @ObservationIgnored var archivesInFlight: Set<String> = []
     /// Archived threads whose panel is still dropping into the Archived
     /// heading (`ArchiveFlight`). The heading leaves them out of its count
     /// and rows until they land, so the count rolls on as one arrives.
@@ -181,6 +195,17 @@ final class AppModel {
     @ObservationIgnored var archivesNotSent: Set<String> = []
     var threads: [String: ThreadSummary] = [:] {
         didSet {
+            // An archive still on its way (`archive`): a summary from before
+            // the runner had it (thread.updated, a reconnect's list, another
+            // runner's) doesn't bring the row back. Setting threads in its
+            // own didSet doesn't run didSet again.
+            for id in archivesInFlight where threads[id] != nil && threads[id]?.archivedAt == nil {
+                threads[id]?.archivedAt = oldValue[id]?.archivedAt
+            }
+            // An archived thread's Terminal shell stops (TerminalPanel.swift),
+            // but not on the guess: a refused archive brings the row back,
+            // and its shell should still be there.
+            Terminals.shared.stopArchived(in: threads, except: archivesInFlight)
             // A summary from another runner never says which runner it's on
             // (runnerId is this app's own marker), so one stored over a
             // remote thread's (markSeen's reply, a rename's, an archive's)
@@ -188,7 +213,9 @@ final class AppModel {
             // into one of this Mac's: its calls go to this Mac's runner
             // ("Thread not found") and its own runner's events are dropped.
             // Setting threads in its own didSet doesn't run didSet again.
-            for (id, thread) in threads where thread.runnerId == nil {
+            // Except one this Mac's own list says has arrived here from a move
+            // (`arrivedHere`, confirmArrival).
+            for (id, thread) in threads where thread.runnerId == nil && !arrivedHere.contains(id) {
                 if let runnerId = oldValue[id]?.runnerId { threads[id]?.runnerId = runnerId }
             }
             // Nor does the sidebar's table say if another runner's thread is
@@ -202,11 +229,9 @@ final class AppModel {
             // A thread read through Convex keeps the asks of the card it
             // shows, whatever summary is stored over it (the table's row,
             // a reply's): none of those carry them (withRelayCard).
-            if !directRemoteLink {
-                for (id, thread) in threads where thread.runnerId != nil && oldValue[id] != thread {
-                    let carded = withRelayCard(thread)
-                    if carded != thread { threads[id] = carded }
-                }
+            for (id, thread) in threads where thread.runnerId != nil && oldValue[id] != thread {
+                let carded = withRelayCard(thread)
+                if carded != thread { threads[id] = carded }
             }
             threadsVersion &+= 1
             refreshDockBadge()
@@ -231,7 +256,6 @@ final class AppModel {
                 mainContextChanged()
                 // Back and forward set this without select().
                 servePanelRequest()
-                tidyRemoteClients()
             }
         }
     }
@@ -282,7 +306,14 @@ final class AppModel {
     /// id, or "new"): with threads open in several panels, only that one's.
     var focusRequests: [String: Int] = [:]
     var now = Date()
-    var drafts: [String: Draft] = [:]
+    var drafts: [String: Draft] = [:] {
+        // Kept on disk once the app has asked (DraftStore), so a quit or a
+        // relaunch can't take a message that never went (10 Nov).
+        didSet { draftStore?.changed(self) }
+    }
+    @ObservationIgnored var draftStore: DraftStore?
+    /// Set once this app has handed its drafts to a new build at "go".
+    @ObservationIgnored var handingOver = false
     /// Messages being edited, by thread id: the seq of the message the
     /// composer's draft will replace (docs/protocol.md, "Editing a
     /// message"), and whatever was in the box before, to put back after.
@@ -291,6 +322,13 @@ final class AppModel {
     /// thread id, waiting in the composer to go with his next message.
     /// Ones for an older card count as none.
     var askPicks: [String: AskPicks] = [:]
+    /// Answers sent from the Projects page's decision cards, by thread id,
+    /// until the thread takes them (ProjectDecisions.isSending).
+    var decisionSends: [String: DecisionSend] = [:]
+    /// The tab last picked on each project's page (ProjectTabs), while the
+    /// app runs, and the one each opened on this visit when none was.
+    var projectTabsPicked: [String: ProjectTab] = [:]
+    var projectTabsOpenedOn: [String: ProjectTab] = [:]
     /// The seq of the card of asks collapsed on each thread, by thread id.
     /// By card, so the next one, something new to decide, always opens.
     var collapsedCards: [String: Int] = [:]
@@ -302,6 +340,8 @@ final class AppModel {
     /// The first thread list has arrived. Until then the sidebar list stays
     /// empty, so it's filled in one go.
     var threadsLoaded = false
+    /// How many archived threads the Archived section shows (`ArchiveRows`).
+    var archiveLimit = ArchiveRows.first
     /// New-thread settings shown on the composer. The model and effort
     /// start as whatever was picked last, on any thread, and are kept
     /// across launches; the folder and "Ask before edits" are for one
@@ -314,7 +354,7 @@ final class AppModel {
     /// The runner the next new thread starts on ("Runs on", the
     /// composer's machine chip): nil for this Mac, or another runner's id.
     /// Its folder, account, model and effort are then that runner's
-    /// (`newThreadLogins`), and the thread is made over its connection.
+    /// (`newThreadLogins`), and the thread is made through Convex.
     /// For one thread, like the folder: back to this Mac after it starts.
     var newThreadRunnerId: String?
     /// The runner new threads start on when Mike hasn't picked one (the
@@ -325,19 +365,6 @@ final class AppModel {
     }
     static let defaultRunnerKey = "defaultRunnerId"
 
-    /// Settings > Runners, "Connect to other machines directly": open other
-    /// runners' threads over the tailnet, as before 5 Nov, rather than
-    /// through this Mac's runner and Convex (docs/protocol.md, "Other
-    /// runners' threads through the backend"). Off by default; it goes once
-    /// the Convex way has been used for a while.
-    var directRemoteLink: Bool = UserDefaults.standard.bool(forKey: AppModel.directRemoteLinkKey) {
-        didSet {
-            guard directRemoteLink != oldValue else { return }
-            UserDefaults.standard.set(directRemoteLink, forKey: Self.directRemoteLinkKey)
-            switchedRemoteLink()
-        }
-    }
-    static let directRemoteLinkKey = "directRemoteLink"
     /// Mike picked this draft's runner himself, so the default doesn't
     /// move it when the runner list next changes.
     var newThreadRunnerPicked = false
@@ -351,8 +378,7 @@ final class AppModel {
     /// by `pools.updated`.
     var pools: [Pool] = []
     /// Other runners' logins (accounts, pools, defaults), by runner id, from
-    /// the hello their connection made and their accounts.updated and
-    /// pools.updated since: what the composer's pickers offer on one of
+    /// Convex through this Mac's runner (`loadRelayLogins`): what the composer's pickers offer on one of
     /// their threads (`logins(for:)`).
     var remoteLogins: [String: RunnerLogins] = [:]
     /// The runner has pools. False for an older one, which sends none in
@@ -371,7 +397,27 @@ final class AppModel {
     /// kept across launches: a Codex model is no use to a Claude thread.
     private(set) var lastModels: [String: String] = AppModel.loadMemory(AppModel.lastModelKey)
     private(set) var lastEfforts: [String: String] = AppModel.loadMemory(AppModel.lastEffortKey)
-    var newThreadPermission: PermissionMode = .full
+    /// The mode picked in the new-thread composer, for that draft only.
+    /// Nil: the last one picked, else the runner's default (`newThreadPermission`).
+    var newThreadPermissionPick: PermissionMode?
+    /// The mode last picked for a new thread, kept across launches as the
+    /// model is: Full, Ask or Auto, never Plan first, which is for one task
+    /// (Mike, 13 Nov, after Ian kept landing back on Auto).
+    private(set) var lastPermission: PermissionMode? = AppModel.loadLastPermission()
+    /// The mode the next new thread starts on: the one picked, else the one
+    /// last picked, else its runner's `defaults.permissionMode` (Auto on a
+    /// new install), else Full access, for a runner that has none, predates
+    /// it, or hasn't said yet.
+    var newThreadPermission: PermissionMode {
+        get { newThreadPermissionPick ?? lastPermission ?? newThreadLogins?.defaults.permissionMode ?? .full }
+        set {
+            newThreadPermissionPick = newValue
+            if [.full, .ask, .auto].contains(newValue) {
+                lastPermission = newValue
+                UserDefaults.standard.set(newValue.rawValue, forKey: Self.lastPermissionKey)
+            }
+        }
+    }
     /// What the runner says about the Claude and Codex CLIs (`clis.list`,
     /// `clis.updated`). Empty until it's said anything.
     var clis: [CliStatus] = []
@@ -405,9 +451,16 @@ final class AppModel {
     /// Empty from a runner before step 6, or before it answers: then
     /// there's no choice to offer and every schedule is this runner's.
     var runners: [RunnerInfo] = []
+    /// Asking for `runners` again after a failure (`retryRunners`).
+    @ObservationIgnored var runnersRetry: Task<Void, Never>?
+    @ObservationIgnored var runnersRetryDelay: Duration = .seconds(30)
+    /// The experiments on for this Mac's runner, from its hello.
+    var experiments: Set<String> = []
+    /// The Move sheet, while it's open.
+    var moveRequest: MoveRequest?
     /// Other runners, from this one (docs/protocol.md, "Other runners'
-    /// threads"): their names, icons, whether they're online and how to
-    /// reach them. Their threads are in `threads`, marked with `runnerId`
+    /// threads"): their names, icons and whether they're online. Their
+    /// threads are in `threads`, marked with `runnerId`
     /// (RemoteRunners.swift).
     var remoteRunners: [RemoteRunner] = []
     /// Mike's runner order (`remoteIndex.order`, backend API 58), or the
@@ -426,23 +479,16 @@ final class AppModel {
     var runnerStats: [String: RunnerMachineStats] = [:]
     /// The runner has answered `runners.stats` at least once since then.
     var runnerStatsAsked = false
-    /// The last `remoteThreads` list, kept to put the sidebar table's rows
-    /// back once a runner's own connection closes.
+    /// The last `remoteThreads` list.
     @ObservationIgnored var remoteIndex = RemoteThreads()
-    /// Other runners' threads whose summary came from their own runner's
-    /// connection, which is fuller and fresher than the sidebar table's
-    /// row, until that connection closes.
-    @ObservationIgnored var liveRemote: Set<String> = []
     /// Threads made on another runner through Convex that the sidebar table
-    /// doesn't list yet: kept until it does.
+    /// doesn't list yet, and threads whose old runner let them go during a
+    /// move that where they're going hasn't listed yet (movedAway): kept
+    /// until it does.
     @ObservationIgnored var madeRemote: Set<String> = []
-    /// One connection per other runner, made when one of its threads is
-    /// opened.
-    @ObservationIgnored var remoteClients = RemoteClients(version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev")
-    @ObservationIgnored var remoteTidy: Task<Void, Never>?
-    /// This Mac's copies of files in other runners' threads
-    /// (`remoteFiles`, RemoteFiles.swift), made on first use.
-    @ObservationIgnored var remoteFileStore: RemoteFileStore?
+    /// Threads being stored as this Mac's because its own list has them,
+    /// having moved here: `threads`' didSet lets their old runner go.
+    @ObservationIgnored var arrivedHere: Set<String> = []
     /// The thread a transcript link is being followed in, while a click on
     /// it is handled (TranscriptTextView.forItsThread): a thread open in a
     /// panel isn't the selected one, and another Mac's paths mustn't be
@@ -531,6 +577,10 @@ final class AppModel {
     /// The backend can't send phone notifications (a self-hosted one), from
     /// runner.status, so Phone & browser says so.
     var pushOff = false
+    /// The backend is on this Mac only (runner.status's sync.url on
+    /// 127.0.0.1): no phone can pair, and the website and share links only
+    /// open here.
+    var localOnly = false
     var devicesReason: String?
     var devicesError: String?
     var devicesUnsupported = false
@@ -538,6 +588,8 @@ final class AppModel {
     var devicesLoading = false
     /// Bumped by the automation to show the pairing code, for screenshots.
     var pairRequest = 0
+    /// Bumped by the automation to close it again, as its Done does.
+    var pairDoneRequest = 0
     /// The schedule editor sheet, when it's open (ScheduleEditor).
     var scheduleEditor: ScheduleEditorState?
     /// A sidebar row drawn as if the pointer were over it, so the screenshot
@@ -576,6 +628,26 @@ final class AppModel {
             }
         }
     }
+    /// The Threads panel folded away with ⌘/ (Wayne, 8 Nov). Unlike Hide
+    /// Threads it stays in the dock layout, only unavailable (DockContent),
+    /// so it comes back where it was, as wide as it was, and the main panel
+    /// takes its room meanwhile. Remembered across launches.
+    var threadsCollapsed: Bool = UserDefaults.standard.bool(forKey: AppModel.threadsCollapsedKey) {
+        didSet { UserDefaults.standard.set(threadsCollapsed, forKey: Self.threadsCollapsedKey) }
+    }
+    static let threadsCollapsedKey = "threadsCollapsed"
+    /// The sidebar's Projects view, folded to a row a project (the
+    /// projectDecisions experiment): the ones Mike has opened, by project id
+    /// (ProjectFolds.unfiledId for Not in a project). Folded by default;
+    /// remembered across launches (Mike, 11 Nov).
+    var openProjectRows: Set<String> = Set(UserDefaults.standard.stringArray(forKey: AppModel.openProjectRowsKey) ?? []) {
+        didSet { UserDefaults.standard.set(openProjectRows.sorted(), forKey: Self.openProjectRowsKey) }
+    }
+    static let openProjectRowsKey = "projectsList.openRows"
+
+    func toggleProjectRow(_ id: String) {
+        if openProjectRows.remove(id) == nil { openProjectRows.insert(id) }
+    }
     /// Inbox sections folded away under their heading, remembered across
     /// launches (Mike asked 27 Oct). Hibernating and Archive start folded.
     var collapsedSections: Set<InboxSection> = AppModel.storedCollapsedSections() {
@@ -602,6 +674,11 @@ final class AppModel {
     /// (SlashPalette.swift), for the composer's palette.
     var slashCommands: [String: [SlashCommand]] = [:]
     @ObservationIgnored var slashFetches: [String: Task<Void, Never>] = [:]
+    /// Each thread's last `threads.contextUsage` answer, for the context
+    /// ring's popover, and the threads it's being asked for (its refresh
+    /// button spins meanwhile).
+    var contextUsage: [String: ContextUsageAnswer] = [:]
+    var contextUsageLoading: Set<String> = []
     /// The sizes Mike dragged the palette and its columns to, kept for
     /// next time.
     var slashPaletteLayout: SlashPalette.Layout = (UserDefaults.standard.data(forKey: "slashPaletteLayout")).flatMap { try? JSONDecoder().decode(SlashPalette.Layout.self, from: $0) } ?? SlashPalette.Layout() {
@@ -703,7 +780,8 @@ final class AppModel {
     /// came along is still remembered; other providers add ".<provider>".
     static let lastModelKey = "lastModel"
     static let lastEffortKey = "lastEffort"
-    static let memoryProviders = ["claude", "codex"]
+    static let lastPermissionKey = "lastPermissionMode"
+    static let memoryProviders = ["claude", "codex", "cursor", "opencode"]
     static let collapsedSectionsKey = "collapsedSections"
     /// Set once Hibernating and Archive have been folded the first time.
     /// They came after collapsedSections did, so a saved list without them
@@ -743,7 +821,6 @@ final class AppModel {
             save?(layout)
             self?.dockChanged(layout)
         }
-        wireRemoteClients()
         clockTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
@@ -840,14 +917,14 @@ final class AppModel {
     }
 
     /// The logins a new thread's pickers offer and it starts on: this
-    /// Mac's, or the chosen runner's once its connection has said hello
-    /// (nil until then).
+    /// Mac's, or the chosen runner's once Convex has given them (nil until
+    /// then).
     var newThreadLogins: RunnerLogins? {
         guard let runnerId = newThreadRunnerId else { return RunnerLogins(accounts: accounts, pools: pools, defaults: defaults) }
         return remoteLogins[runnerId]
     }
 
-    /// The same, with none for a runner that hasn't said hello yet.
+    /// The same, with none for a runner whose logins haven't come yet.
     var draftLogins: RunnerLogins {
         newThreadLogins ?? RunnerLogins(accounts: [], pools: [], defaults: RunnerDefaults(cwd: "", accountId: ""))
     }
@@ -881,6 +958,10 @@ final class AppModel {
 
     static func memoryKey(_ base: String, provider: String) -> String {
         provider == "claude" || provider.isEmpty ? base : base + "." + provider
+    }
+
+    private static func loadLastPermission() -> PermissionMode? {
+        UserDefaults.standard.string(forKey: lastPermissionKey).flatMap(PermissionMode.init(rawValue:)).flatMap { [.full, .ask, .auto].contains($0) ? $0 : nil }
     }
 
     private static func loadMemory(_ base: String) -> [String: String] {

@@ -9,15 +9,18 @@ import type { Account, EffortLevel, ImageRef, MessageOrigin, PermissionMode, Thr
 import { ErrorCode, LIMITS, RpcError } from '../protocol.ts';
 import type { Schedule } from '../protocol.ts';
 import type { ThreadRecord } from '../store.ts';
-import { expandHome, readRunnerJson } from '../config.ts';
+import { expandHome, peekRunnerJson } from '../config.ts';
 import { isDirectory } from '../fsutil.ts';
 import { ASK_CODEX_MODEL, HAIKU } from '../models/index.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import type { ThreadState } from '../runner.ts';
-import { checkImages, effortTitle, isClaudeModel, modelRow, modelTitle, newRuntime, oneLine, providerName, titleFrom, userMessage } from '../runner.ts';
+import { checkImages, effortTitle, isClaudeModel, modelRow, modelTitle, newRuntime, oneLine, titleFrom, userMessage } from '../runner.ts';
+import { providerInfo, providerName } from '../providers.ts';
 import { cutSafely } from '../safe-cut.ts';
+import { experimentOn } from '../experiments.ts';
+import { findSameWork, sameWorkNote, type SameWorkCandidate } from '../same-work.ts';
 
 export const newThreadsPart = {
   create(this: Runner, params: {
@@ -36,9 +39,17 @@ export const newThreadsPart = {
     // worktree per thread.
     worktree?: boolean;
     startedBy?: ThreadStartedBy;
+    // Not to sit under the thread in startedBy in the sidebar
+    // (docs/protocol.md, "Nested threads").
+    detached?: boolean;
     // Started by a sandboxed thread's agent in a sandbox folder: shut in
     // one too (ThreadRecord.confined).
     confined?: boolean;
+    // The user has said this thread may run outside the sandbox the thread
+    // in startedBy is shut in (a create_thread card they allowed, their
+    // press of a button they allowed). Without it, a thread started from a
+    // sandboxed one is shut in too (makeThread).
+    unconfine?: boolean;
     // Projects it starts in (New Thread on a project's page), joined
     // before its first turn, so that turn already has the project's brief.
     projectIds?: string[];
@@ -54,6 +65,8 @@ export const newThreadsPart = {
     }
     const { st, notes } = this.makeThread(params);
     if (projectIds.length) this.projects!.changeMembership(st.rec.id, { add: projectIds, by: 'mike' });
+    const sameWork = params.text?.trim() && experimentOn(this.cfg.home, 'sameWork') ? this.findSameWork(st, params.text) : undefined;
+    if (sameWork) notes.push(sameWork);
     const turnId = this.sendTo(st, params.text ?? '', params.images ?? [], { origin: params.origin, scheduleId: params.scheduleId });
     // Under the first turn, so they read as part of starting it.
     for (const text of notes) this.emit(st, { type: 'system.note', text }, st.rt.turn?.turnId ?? turnId);
@@ -152,6 +165,53 @@ export const newThreadsPart = {
     return { threads: made.reverse() };
   },
 
+  // Open threads that may already be doing what a new thread's first
+  // message asks (same-work.ts), kept on the record for its first
+  // session's instructions. Returns a line for Mike's transcript, or
+  // undefined when there are none. Never fails the create.
+  findSameWork(this: Runner, st: ThreadState, text: string): string | undefined {
+    const { rec } = st;
+    try {
+      const candidates: SameWorkCandidate[] = [];
+      const me = this.authorityNow(rec.id);
+      for (const other of this.threads.values()) {
+        const o = other.rec;
+        // Not itself, the thread that started it (its starter knows what
+        // it's doing), another run of the same schedule, or a sample.
+        if (o.id === rec.id || o.archivedAt || o.sample || o.id === rec.startedBy?.threadId) continue;
+        if (rec.schedule && o.schedule?.id === rec.schedule.id) continue;
+        // Nor one with less access (mode or sandbox) than this one: its
+        // title and words are its agent's own (update_thread), and handing
+        // them to this agent is a message upward that send_message would
+        // ask Mike about first (Daybreak, 12 Nov 2026, finding 111).
+        if (!this.mayTellOf(me, o.id)) continue;
+        candidates.push({
+          id: o.id,
+          title: o.title,
+          asked: o.asked,
+          preview: o.preview,
+          keywords: o.keywords,
+          place: o.worktree && !o.worktree.removedAt ? o.worktree.mainCheckout : o.cwd,
+          projectIds: (o.projects ?? []).map((m) => m.id),
+          status: o.snoozedUntil || o.wakeWhen ? 'snoozed' : o.status === 'running' || o.status === 'starting' ? 'working' : 'idle',
+          lastActivityAt: o.lastActivityAt,
+        });
+      }
+      const matches = findSameWork(text, rec.cwd, (rec.projects ?? []).map((m) => m.id), candidates);
+      const note = sameWorkNote(matches, this.clock.now());
+      if (!note) return undefined;
+      rec.sameWork = note;
+      rec.sameWorkIds = matches.map((m) => m.candidate.id);
+      this.markDirty(st);
+      this.log.info('found threads that may be the same work', { threadId: rec.id, ids: matches.map((m) => m.candidate.id) });
+      const titles = matches.map((m) => `"${m.candidate.title.replace(/\s+/g, ' ').trim()}"`);
+      return `${titles.length === 1 ? 'An open thread' : `${titles.length} open threads`} may already be on this, so its agent will look first: ${titles.join(', ')}.`;
+    } catch (e) {
+      this.log.warn("couldn't look for threads doing the same work", { threadId: rec.id, error: String(e) });
+      return undefined;
+    }
+  },
+
   // The record and state of a new thread, before anything is sent to it:
   // its folder, login, model and effort as create picks them.
   makeThread(this: Runner, params: {
@@ -167,7 +227,9 @@ export const newThreadsPart = {
     scheduleId?: string;
     worktree?: boolean;
     startedBy?: ThreadStartedBy;
+    detached?: boolean;
     confined?: boolean;
+    unconfine?: boolean;
   }): { st: ThreadState; notes: string[] } {
     this.checkAccepting();
     // New threads belong on the new release.
@@ -179,7 +241,7 @@ export const newThreadsPart = {
     // keepAccount pins new threads to its own account.
     let poolId: string | undefined;
     let accountId = params.accountId;
-    if (accountId === undefined && (params.poolId !== undefined || !readRunnerJson(this.cfg.home).defaults?.keepAccount)) {
+    if (accountId === undefined && (params.poolId !== undefined || !peekRunnerJson(this.cfg.home).defaults?.keepAccount)) {
       const picked = this.pickForNew({ poolId: params.poolId, cwd, model: params.model });
       if (picked) ({ poolId, accountId } = picked);
     }
@@ -191,9 +253,16 @@ export const newThreadsPart = {
     // In a sandbox folder a Claude thread is shut in it from the start. One
     // asked for that which can't be (a Codex login, a folder outside) is
     // refused rather than started outside (sandbox.ts).
-    const sandboxed = account.provider === 'claude' && this.sandboxed(cwd);
-    if (params.confined && !sandboxed) {
-      throw new RpcError(ErrorCode.badParams, account.provider === 'claude' ? `${cwd} isn't in a sandbox folder, and a sandboxed thread can only start threads in one without asking.` : "A sandboxed thread can only start Claude threads, as Codex doesn't run in the sandbox.");
+    const canSandbox = providerInfo(account.provider).sandbox;
+    const sandboxed = canSandbox && this.sandboxed(cwd);
+    // Started from a thread that's shut in a sandbox: shut in too, unless
+    // the user said otherwise. A caller that forgets `confined` (a lab
+    // review did, Daybreak 10 Nov 2026) gets a refusal, not a thread
+    // outside the sandbox with the same access.
+    const parent = params.startedBy?.threadId ? this.threads.get(params.startedBy.threadId) : undefined;
+    const confined = Boolean(params.confined) || (Boolean(parent?.rec.confined) && params.unconfine !== true);
+    if (confined && !sandboxed) {
+      throw new RpcError(ErrorCode.badParams, canSandbox ? `${cwd} isn't in a sandbox folder, and a sandboxed thread can only start threads in one without asking.` : `A sandboxed thread can only start Claude threads, as ${providerName(account.provider)} doesn't run in the sandbox.`);
     }
     const now = this.isoNow();
     const id = crypto.randomUUID();
@@ -205,7 +274,8 @@ export const newThreadsPart = {
       accountId,
       ...(poolId ? { poolId } : {}),
       provider: account.provider,
-      permissionMode: params.permissionMode ?? 'full',
+      // None named: runner.json's default (a new install's is auto), else full.
+      permissionMode: params.permissionMode ?? this.cfg.defaults.permissionMode ?? 'full',
       ...(sandboxed ? { confined: true as const } : {}),
       status: 'idle',
       createdAt: now,
@@ -234,6 +304,8 @@ export const newThreadsPart = {
       // renamed, archived or deleted later.
       const from = startedBy.threadId ? this.threads.get(startedBy.threadId) : undefined;
       rec.startedBy = { ...startedBy, ...(from ? { threadTitle: from.rec.title } : {}) };
+      // Only means something for a thread another thread started.
+      if (params.detached && startedBy.kind === 'thread' && startedBy.threadId) rec.detached = true;
     }
     this.store.create(rec);
     const st: ThreadState = { rec, rt: newRuntime(this.clock.now()) };
@@ -272,13 +344,16 @@ export const newThreadsPart = {
       notes.push(`${model} isn't a ${providerName(provider)} model, so this thread uses ${uses}.`);
       model = fallback;
     }
+    // No effort levels of ours on this provider (providers.ts).
+    if (effort && providerInfo(provider).effort === 'none') effort = undefined;
     if (effort) {
       const row = modelRow(account, model ?? account.defaultModel);
-      const offered = (e: EffortLevel) => !(provider === 'claude' && e === 'ultra') && (!row?.effortLevels || row.effortLevels.includes(e));
+      const noUltra = providerInfo(provider).effort === 'claude';
+      const offered = (e: EffortLevel) => !(noUltra && e === 'ultra') && (!row?.effortLevels || row.effortLevels.includes(e));
       if (!offered(effort)) {
         const fallback = this.defaultEffortFor(provider);
         const next = fallback && fallback !== effort && offered(fallback) ? fallback : undefined;
-        const why = provider === 'claude' && effort === 'ultra' ? `${effortTitle(effort)} effort is Codex only` : `${row ? row.title : 'This model'} doesn't offer ${effortTitle(effort)} effort`;
+        const why = noUltra && effort === 'ultra' ? `${effortTitle(effort)} effort is Codex only` : `${row ? row.title : 'This model'} doesn't offer ${effortTitle(effort)} effort`;
         notes.push(`${why}, so this thread uses ${next ? `${effortTitle(next)} effort` : "the model's own level"}.`);
         effort = next;
       }
@@ -288,13 +363,16 @@ export const newThreadsPart = {
 
   // Whether a thread on this account can run this model id. Codex: one the
   // account lists, or before the list is known anything starting gpt-.
-  // Claude: anything but a Codex id, unless the account itself lists it.
+  // Claude: anything but another provider's id, unless the account itself
+  // lists it.
   modelFits(this: Runner, account: Account, model: string): boolean {
     if (modelRow(account, model)) return true;
     if (account.provider === 'codex') return !account.models?.length && model.startsWith('gpt-');
+    // An ACP agent runs what it lists, and nothing can be told from the name.
+    if (account.provider !== 'claude') return false;
     if (isClaudeModel(model)) return true;
-    const codexIds = this.safeAccounts().filter((a) => a.provider === 'codex').some((a) => modelRow(a, model));
-    return !model.startsWith('gpt-') && !codexIds;
+    const elsewhere = this.safeAccounts().filter((a) => a.provider !== 'claude').some((a) => modelRow(a, model));
+    return !model.startsWith('gpt-') && !elsewhere;
   },
 };
 

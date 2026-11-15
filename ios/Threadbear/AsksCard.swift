@@ -53,17 +53,20 @@ struct AsksCard: View {
                     .textSelection(.enabled)
                     .foregroundStyle(ticked ? .secondary : .primary)
             }
-            if !ticked, !(ask.links ?? []).isEmpty || !ask.choices.isEmpty {
-                FlowLayout(spacing: 8) {
-                    ForEach(ask.links ?? [], id: \.url) { link in
-                        if let url = URL(string: link.url) {
-                            Link(destination: url) {
-                                Label(link.title, systemImage: "arrow.up.right.square")
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(.secondary)
-                        }
+            if !ticked, ask.hasNotes {
+                // Each answer says what it does: rows, the note under its
+                // label, as the Mac draws them; links in a row above.
+                if !(ask.links ?? []).isEmpty {
+                    FlowLayout(spacing: 8) { links(ask) }.controlSize(.small)
+                }
+                VStack(spacing: 6) {
+                    ForEach(Array(ask.choices.enumerated()), id: \.offset) { choice, label in
+                        choiceButton(label, note: ask.note(choice), index: index, choice: choice, suggested: ask.suggestedIndex == choice)
                     }
+                }
+            } else if !ticked, !(ask.links ?? []).isEmpty || !ask.choices.isEmpty {
+                FlowLayout(spacing: 8) {
+                    links(ask)
                     ForEach(Array(ask.choices.enumerated()), id: \.offset) { choice, label in
                         choiceButton(label, index: index, choice: choice, suggested: ask.suggestedIndex == choice)
                     }
@@ -73,7 +76,22 @@ struct AsksCard: View {
         }
     }
 
-    private func choiceButton(_ label: String, index: Int, choice: Int, suggested: Bool) -> some View {
+    @ViewBuilder private func links(_ ask: PhoneAsk) -> some View {
+        ForEach(ask.links ?? [], id: \.url) { link in
+            if let url = URL(string: link.url) {
+                Link(destination: url) {
+                    Label(link.title, systemImage: "arrow.up.right.square")
+                }
+                .buttonStyle(.bordered)
+                .tint(.secondary)
+            }
+        }
+    }
+
+    /// The muted gold of the Mac's "Recommended" star.
+    static let recommendedStar = Color(red: 0.86, green: 0.70, blue: 0.33)
+
+    private func choiceButton(_ label: String, note: String? = nil, index: Int, choice: Int, suggested: Bool) -> some View {
         let picked = picks[index] == choice
         return Button {
             guard !busy else { return }
@@ -87,10 +105,27 @@ struct AsksCard: View {
                 picks[index] = picked ? nil : choice
             }
         } label: {
-            HStack(spacing: 4) {
-                // The agent's own pick, as the Mac marks it.
-                if suggested && !picked { Image(systemName: "star.fill").imageScale(.small).foregroundStyle(.secondary) }
-                Text(label).spinning(picked && busy && asks.count == 1, tint: .white)
+            if let note {
+                // A row: the answer, then what it does, full width.
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 4) {
+                        Text(label).fontWeight(.medium).spinning(picked && busy && asks.count == 1, tint: .white)
+                        // The agent's pick: a small gold star and "Recommended", as on the Mac.
+                        if suggested && !picked {
+                            Image(systemName: "star.fill").font(.system(size: 9)).foregroundStyle(Self.recommendedStar)
+                            Text("Recommended").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                    Text(note).font(.footnote).foregroundStyle(picked ? .white.opacity(0.85) : .secondary)
+                        .multilineTextAlignment(.leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                HStack(spacing: 4) {
+                    // The agent's own pick, as the Mac marks it.
+                    if suggested && !picked { Image(systemName: "star.fill").imageScale(.small).foregroundStyle(Self.recommendedStar).accessibilityLabel("Recommended") }
+                    Text(label).spinning(picked && busy && asks.count == 1, tint: .white)
+                }
             }
         }
         .buttonStyle(picked ? AnyButtonStyle(.borderedProminent) : AnyButtonStyle(.bordered))
@@ -106,9 +141,13 @@ struct AsksCard: View {
 /// (end_turn's `next`) under "Or carry on". A tap ticks one (again
 /// unticks it), so he can pick several, as on the Mac (30 Oct); Send on
 /// the card sends them, and the composer's Send takes them with what's
-/// typed.
+/// typed. What the runner found still open (loose ends) goes between,
+/// under "Still open", or "Coming back" when it's only booked check-ins,
+/// as on the Mac: plain lines, and a thread one opens that thread.
 struct DoneCard: View {
     let next: [String]
+    var looseEnds: [PhoneLooseEnd] = []
+    var openThread: @MainActor (String) -> Void = { _ in }
     @Binding var picked: Set<Int>
     /// The ticked ones are on their way: Send spins, and nothing more to press.
     var busy: Bool
@@ -132,6 +171,7 @@ struct DoneCard: View {
                 .controlSize(.small)
                 .accessibilityLabel("Archive")
             }
+            if !looseEnds.isEmpty { looseEndsList }
             if !next.isEmpty {
                 Text("Or carry on").font(.footnote).foregroundStyle(.secondary)
                 ForEach(Array(next.enumerated()), id: \.offset) { index, step in
@@ -170,6 +210,46 @@ struct DoneCard: View {
         .sensoryFeedback(.selection, trigger: tickTaps)
         .sensoryFeedback(.impact(weight: .light), trigger: sendTaps)
     }
+
+    /// Open ones first, then the check-ins, each with its time.
+    private var looseEndsList: some View {
+        let ordered = looseEnds.filter { !$0.isBooked } + looseEnds.filter(\.isBooked)
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(looseEnds.contains { !$0.isBooked } ? "Still open" : "Coming back")
+                .font(.footnote).foregroundStyle(.secondary)
+            ForEach(Array(ordered.enumerated()), id: \.offset) { _, end in
+                let row = HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Image(systemName: end.isBooked ? "clock" : "exclamationmark.circle")
+                        .foregroundStyle(end.isBooked ? Color.secondary : Color.orange)
+                        .accessibilityLabel(end.isBooked ? "Booked" : "Still open")
+                    Text(Self.line(end)).multilineTextAlignment(.leading)
+                        .foregroundStyle(end.threadId != nil ? Color.accentColor : Color.primary)
+                    Spacer(minLength: 0)
+                }
+                if let id = end.threadId {
+                    Button { openThread(id) } label: { row.contentShape(Rectangle()) }
+                        .buttonStyle(.plain)
+                } else {
+                    row
+                }
+            }
+        }
+    }
+
+    /// "Fri 13 Nov, 9:30 am: the check-in" for a booked one, else its text.
+    static func line(_ end: PhoneLooseEnd) -> String {
+        guard end.isBooked, let at = end.at, let when = ISO8601DateFormatter.fractional.date(from: at) ?? ISO8601DateFormatter().date(from: at) else { return end.text }
+        return "\(when.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated).hour().minute())): \(end.text)"
+    }
+}
+
+private extension ISO8601DateFormatter {
+    /// The runner's ISO times, with milliseconds.
+    static let fractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
 }
 
 /// A finished turn's work, folded into one line that opens to it, as the
@@ -193,6 +273,23 @@ struct WorkedView: View {
 /// "6 min later · Mine the repo finished": a thin rule with the wait in the
 /// middle, before a turn the agent started by itself (TurnGap). Quiet, like
 /// a chat app's day divider, as on the Mac.
+/// "Moved to alex@example.org: mike@example.net hit its 5-hour limit, back
+/// at 11:30 am.": the runner's line when a thread's login ran out and it
+/// moved to another or is waiting for room. Quiet and centred, as on the
+/// Mac, and on as many lines as it needs.
+struct LoginNoteView: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 2)
+    }
+}
+
 struct GapView: View {
     let gap: TurnGap
 
@@ -240,6 +337,7 @@ struct WorkedItems: View {
                 case let .tools(run): ToolRunView(items: run)
                 case let .worked(inner): WorkedView(worked: inner)
                 case let .gap(gap): GapView(gap: gap)
+                case let .note(note): LoginNoteView(text: note.text)
                 }
             }
         }

@@ -9,14 +9,13 @@
 // preview line and the last activity time go up with it but never cause a
 // write by themselves: they move all through a turn, and a write is what
 // re-runs every watching query.
-import fs from 'node:fs';
-import path from 'node:path';
 import type { Clock, TimerHandle } from './clock.ts';
 import type { Logger } from './log.ts';
 import type { ThreadSummary } from './protocol.ts';
 import type { Notification } from './runner.ts';
 import { digest } from './sync-cache.ts';
 import { forbiddenText, type Post, type Subscribe } from './sync.ts';
+import { isThreadIdShape } from './thread-id.ts';
 
 export type IndexRow = {
   threadId: string;
@@ -36,16 +35,19 @@ export type IndexRow = {
   starredAt?: string;
   startedBy?: { kind: string; label: string; icon?: string; threadTitle?: string; why?: string };
   asked?: string;
+  keywords?: string;
 };
 
 // What the Mac app gets (docs/protocol.md, "Other runners' threads").
-export type RemoteRunner = { id: string; name: string; icon?: string; online: boolean; lastSeenAt: string; rpcUrl?: string; tokenFile?: string };
-export type RemoteThread = IndexRow & { runnerId: string };
+export type RemoteRunner = { id: string; name: string; icon?: string; online: boolean; lastSeenAt: string; followProblem?: string };
+// `moving`: set by the main Mac's runner for a move it knows of (main.ts
+// remoteMoving), never by the backend's rows.
+export type RemoteThread = IndexRow & { runnerId: string; moving?: import('./moves.ts').ThreadMoving };
 // `order`: Mike's runner order (backend API 58), every runner's id, this
 // one's too, for the app's Settings > Runners. Left out before it's heard.
-export type RemoteThreads = { runners: RemoteRunner[]; threads: RemoteThread[]; order?: string[] };
+export type RemoteThreads = { runners: RemoteRunner[]; threads: RemoteThread[]; order?: string[]; ready?: boolean };
 
-type RawRunner = { runnerId: string; name: string; icon?: string; lastSeenAt: number; rpcUrl?: string };
+type RawRunner = { runnerId: string; name: string; icon?: string; lastSeenAt: number; followProblem?: string };
 type SinceRow = RemoteThread & { updatedMs?: number; deleted?: boolean };
 
 const FLUSH_MS = 1000;
@@ -61,7 +63,7 @@ const ONLINE_MS = 3 * 60_000;
 const WATCH_CHECK_MS = 15_000;
 const UNWATCH_AFTER_MS = 2 * 60_000;
 
-export function toIndexRow(t: ThreadSummary, withStartedBy = true, withStars = true, withAsked = true): IndexRow {
+export function toIndexRow(t: ThreadSummary, withStartedBy = true, withStars = true, withAsked = true, withKeywords = true): IndexRow {
   const row: IndexRow = {
     threadId: t.id,
     title: t.title,
@@ -82,6 +84,8 @@ export function toIndexRow(t: ThreadSummary, withStartedBy = true, withStars = t
   // Changes only when Mike sends, which moves the status anyway, so it
   // costs no writes of its own.
   if (withAsked && t.asked) row.asked = t.asked;
+  // Changes after a look or once from the keyword sweep, so rarely.
+  if (withKeywords && t.keywords) row.keywords = t.keywords;
   if (withStartedBy && t.startedBy) {
     // Not the thread's id: only the row's tooltip uses this, by that title.
     const { kind, label, icon, threadTitle, why } = t.startedBy;
@@ -94,12 +98,6 @@ export function toIndexRow(t: ThreadSummary, withStartedBy = true, withStars = t
 function writeKey(r: IndexRow): string {
   const { preview: _p, lastActivityAt: _l, ...rest } = r;
   return digest(JSON.stringify(rest));
-}
-
-// Where another runner's token goes on this Mac, copied in once, so the app
-// can open its threads (`tokenFile` on RemoteRunner).
-export function runnerTokenFile(home: string, runnerId: string): string {
-  return path.join(home, 'secrets', 'runners', `${runnerId}.token`);
 }
 
 export class ThreadIndex {
@@ -119,6 +117,8 @@ export class ThreadIndex {
     takesStars?: () => boolean;
     // Whether it knows `asked` (API 32).
     takesAsked?: () => boolean;
+    // Whether it knows `keywords` (API 74).
+    takesKeywords?: () => boolean;
     // Whether the backend can answer with only the rows changed since the
     // last answer (API 29). Without it, every re-run reads every row.
     takesSince?: () => boolean;
@@ -237,12 +237,12 @@ export class ThreadIndex {
       this.appGoneAt = undefined;
       this.watch();
     }
-    return this.withTokens(this.remote);
+    return { ...this.remote, ready: this.heard() };
   }
 
   /** Whether the list has had an answer (or a refusal) to give, for a caller that can wait a moment for one. */
   heard(): boolean {
-    return this.answered || !this.running || !this.deps.subscribe;
+    return this.answered || !this.deps.subscribe;
   }
 
   /** What was last heard, without starting the watch or looking for token files (relay.ts asks on every request). */
@@ -296,7 +296,7 @@ export class ThreadIndex {
       (v) => {
         this.order = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
         this.remote = { ...this.remote, order: this.order };
-        this.deps.publish?.({ method: 'remoteThreads.updated', params: this.withTokens(this.remote) });
+        this.deps.publish?.({ method: 'remoteThreads.updated', params: { ...this.remote, ready: this.heard() } });
       },
       (e) => this.deps.log.warn('the runner order subscription failed', { error: String(e) }),
     );
@@ -339,13 +339,14 @@ export class ThreadIndex {
   // once, and this runner's app lists only its own threads. Writing this
   // runner's own rows carries on.
   private watchFailed(e: Error): void {
-    // Nothing more coming to wait for: the tools use what was last heard.
-    this.answered = true;
     const refused = forbiddenText(e);
     if (!refused) {
       this.deps.log.warn('the other runners’ threads subscription failed', { error: String(e) });
       return;
     }
+    // A refusal is authoritative: there are no accessible remote rows.
+    // A transient error before the first answer is still an unready list.
+    this.answered = true;
     if (!this.refused) this.deps.log.info('not watching the other runners’ threads: this runner has a runner key, and only the main Mac’s key reads them', { error: refused });
     this.refused = true;
     this.unwatch();
@@ -445,7 +446,7 @@ export class ThreadIndex {
   }
 
   private mark(t: ThreadSummary): void {
-    const row = toIndexRow(t, this.deps.takesStartedBy?.() ?? true, this.deps.takesStars?.() ?? true, this.deps.takesAsked?.() ?? true);
+    const row = toIndexRow(t, this.deps.takesStartedBy?.() ?? true, this.deps.takesStars?.() ?? true, this.deps.takesAsked?.() ?? true, this.deps.takesKeywords?.() ?? true);
     if (this.sent.get(t.id) === writeKey(row)) {
       this.dirty.delete(t.id);
       return;
@@ -519,23 +520,14 @@ export class ThreadIndex {
           ...(r.icon ? { icon: r.icon } : {}),
           online: now - r.lastSeenAt < ONLINE_MS,
           lastSeenAt: new Date(r.lastSeenAt).toISOString(),
-          ...(r.rpcUrl ? { rpcUrl: r.rpcUrl } : {}),
+          ...(r.followProblem ? { followProblem: r.followProblem } : {}),
         })),
-      threads: value?.threads ?? [],
+      // Only ids of a thread id's shape reach the apps and the agent tools
+      // (thread-id.ts): the backend kept whatever a runner wrote before it
+      // checked, and an extra Mac may be compromised.
+      threads: (value?.threads ?? []).filter((t) => isThreadIdShape(t?.threadId)),
       ...(this.order ? { order: this.order } : {}),
     };
-    this.deps.publish?.({ method: 'remoteThreads.updated', params: this.withTokens(this.remote) });
-  }
-
-  // The token file is named only when it's there: no file, no way in.
-  private withTokens(r: RemoteThreads): RemoteThreads {
-    return {
-      ...r,
-      threads: r.threads,
-      runners: r.runners.map((x) => {
-        const file = runnerTokenFile(this.deps.home, x.id);
-        return fs.existsSync(file) ? { ...x, tokenFile: file } : x;
-      }),
-    };
+    this.deps.publish?.({ method: 'remoteThreads.updated', params: { ...this.remote, ready: this.heard() } });
   }
 }

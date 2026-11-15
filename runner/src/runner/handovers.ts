@@ -2,11 +2,22 @@
 // Part of the Runner (runner.ts), split out on 4 Nov 2026 as a plain move so a
 // fork's change to one area doesn't clash with another's. Each method's `this`
 // is the Runner; runner.ts puts them on its prototype.
+import { neutraliseCopied, realCopy } from '../real-copy.ts';
+import { openCardEvents } from '../open-cards.ts';
 import type { Runner } from '../runner.ts';
 import type { RunnerPart } from './part.ts';
-import type { ThreadSummary } from '../protocol.ts';
+import type { PersistedEvent, ThreadSummary } from '../protocol.ts';
+import { ErrorCode, RpcError } from '../protocol.ts';
+import type { ThreadRecord } from '../store.ts';
 import type { Drain, ThreadState } from '../runner.ts';
 import { DRAIN_AGENT_MS, DRAIN_BACKGROUND_MS, DRAIN_CHECK_MS, DRAIN_MAX_OLD_MS, DRAIN_SETTLE_MS, newRuntime } from '../runner.ts';
+
+// Runner.openCards: events read from a log at once, kept small as each
+// chunk is read and parsed in one go on a runner still running turns, and
+// how long it reads before giving up: the primary has stopped waiting by
+// then (handover.ts OPEN_CARDS_DEADLINE_MS, 5 s).
+const OPEN_CARDS_CHUNK = 1_000;
+export const OPEN_CARDS_SCAN_MS = 6_000;
 
 // How long a handover waits for an archive's worktree cleanup (letGo).
 // Removing a big worktree can take a while, and a git change still running
@@ -34,8 +45,10 @@ export const handoversPart = {
       // count that as busy, but its result may start a turn, and an archive
       // waiting for it (archiveWhenGone) isn't saved anywhere to pick up.
       // And one hibernating in words whose model is still working out when
-      // (readyToHandOver): the new runner would wake it.
-      keep: new Set([...keep, ...[...this.threads.values()].filter((st) => st.rt.cleaning || st.rt.hooksRunning || st.rec.wakeWhen?.pending).map((st) => st.rec.id)].filter((id) => this.threads.has(id))),
+      // (readyToHandOver): the new runner would wake it. And one going back
+      // to an earlier message: letting it go mid-edit saved the record from
+      // before the cut, after the files had been put back (13 Nov 2026).
+      keep: new Set([...keep, ...[...this.threads.values()].filter((st) => st.rt.cleaning || st.rt.preparing || st.rt.hooksRunning || st.rt.editing || st.rec.wakeWhen?.pending).map((st) => st.rec.id)].filter((id) => this.threads.has(id))),
       going: new Set(),
       gone: new Set(),
       onHandedOver: opts.onHandedOver,
@@ -58,6 +71,32 @@ export const handoversPart = {
   // The threads a draining runner still has; undefined when not draining.
   keeping(this: Runner): string[] | undefined {
     return this.draining ? [...this.draining.keep] : undefined;
+  },
+
+  // drain.openCards: the cards still open on one thread a draining runner
+  // keeps, read from its own log here, so only those few events cross to
+  // the primary rather than the log (THREADBEAR-1Z, Peers.openCards). One
+  // thread a call, so a long log costs only its own thread, and each answer
+  // is that thread's cards alone. A chunk at a time with a break between,
+  // as this runner is still running those threads' turns.
+  async openCards(this: Runner, threadId: string, opts: { chunk?: number; scanMs?: number } = {}): Promise<PersistedEvent[]> {
+    const chunk = opts.chunk ?? OPEN_CARDS_CHUNK;
+    const until = Date.now() + (opts.scanMs ?? OPEN_CARDS_SCAN_MS);
+    if (!this.draining?.keep.has(threadId) || !this.threads.has(threadId)) throw new RpcError(ErrorCode.moved, 'This runner has handed that thread over to the new one.');
+    const log = this.store.log(threadId);
+    const last = log.lastSeq;
+    // Only the requests still open as it goes, oldest first (openCardEvents
+    // over the whole log), not every one the log has had.
+    const open = new Map<string, PersistedEvent>();
+    for (let from = 1; from <= last; from += chunk) {
+      if (Date.now() > until) throw new RpcError(ErrorCode.busy, 'Out of time reading the thread\'s open cards.');
+      for (const e of log.read(from, Math.min(last, from + chunk - 1))) {
+        if (e.type === 'approval.resolved') open.delete(e.approvalId);
+        else if (openCardEvents([e]).length) open.set((e as { approvalId: string }).approvalId, e);
+      }
+      await new Promise((r) => setImmediate(r));
+    }
+    return [...open.values()];
   },
 
   // Whether this runner has the thread (a draining one lets them go).
@@ -120,7 +159,9 @@ export const handoversPart = {
   // builder agent an agent left running was cut off after 30 minutes).
   readyToHandOver(this: Runner, st: ThreadState, d: Drain): boolean {
     const { rt } = st;
-    if (rt.turn || rt.approvals.size || rt.wakeTimer || rt.hooksRunning || rt.runningActions?.size) return false;
+    // A new worktree still being made or set up (Stop pressed during it):
+    // the next runner would start its CLI before the setup is done.
+    if (rt.turn || rt.approvals.size || rt.wakeTimer || rt.hooksRunning || rt.runningActions?.size || rt.editing || rt.preparing) return false;
     // Hibernating in words: its model is still working out when. Crossing
     // now, the new runner would wake it (wakesOnStart) and this one's answer
     // would go nowhere. Not past DRAIN_MAX_OLD_MS, as for background work.
@@ -162,7 +203,7 @@ export const handoversPart = {
     rt.deltaTimer?.cancel();
     rt.wakeTimer?.cancel();
     rt.generation++;
-    this.store.save(rec);
+    this.store.saveIfChanged(rec);
     rt.deleted = true;
     this.dirty.delete(rec.id);
     this.threads.delete(rec.id);
@@ -177,30 +218,56 @@ export const handoversPart = {
   adopt(this: Runner, threadId: string, opts: { crashed?: boolean } = {}): ThreadSummary | undefined {
     const had = this.threads.get(threadId);
     if (had) return this.summary(had);
+    // A thread handed over while this runner is still connecting to the old
+    // one comes before start: which worktrees are held is worked out first,
+    // from every thread on disk, and before this one's record, if it can't
+    // be read, is rebuilt without its worktree (Muse's review, 11 Nov 2026).
+    if (!this.unvouchedSettled) {
+      const all = this.store.loadAll();
+      this.settleUnvouched(all.records, all.broken);
+    }
     this.store.forget(threadId);
-    const rec = this.store.load(threadId) ?? this.rebuild(threadId);
+    let rec: ThreadRecord | undefined;
+    try {
+      rec = this.store.load(threadId) ?? this.rebuild(threadId);
+    } catch (e) {
+      this.log.error("couldn't rebuild a handed-over thread's record", { threadId, error: String(e) });
+    }
     if (!rec) {
       this.log.warn('a handed-over thread is gone', { threadId });
       return undefined;
     }
+    // Neutralised like the ones loaded at start (real-copy.ts).
+    const copy = realCopy(this.store.home);
+    if (copy) this.store.save(neutraliseCopied(rec, copy.work));
+    // An old runner's mark of a worktree the always-trust doesn't reach
+    // (settleUnvouched), set after this one started.
+    const w = rec.worktree;
+    if (w && w.unvouched === true && typeof w.path === 'string' && !w.removedAt) this.patchTrust.unvouch?.(w.path);
     rec.lastSeq = this.store.log(rec.id).lastSeq;
     const st: ThreadState = { rec, rt: newRuntime(Date.parse(rec.lastActivityAt) || 0) };
     this.threads.set(rec.id, st);
     // A thread that was busy on the old runner comes across here, not at
     // start, so it learns its "You: ..." line here too.
-    if (rec.asked === undefined && !rec.archivedAt) this.backfillAsked(rec);
-    this.recoverReviews(st);
-    // Handed over before its worktree cleanup finished (letGo's limit).
-    void this.settleLostCleanups([st], false);
-    if (opts.crashed) {
-      // main.ts carries it on (carryOnStopped), after any resume of its own.
-      if (this.recover(st)) this.notice('info', `The old runner stopped while "${rec.title}" was mid-turn.`);
-    }
-    // Hibernating until the runner restarts: for this thread, coming across
-    // is the restart.
-    if (this.wakesOnStart(rec)) this.wake(st, 'restart');
-    else if (rec.queue.length && this.bucket(rec) === 'inbox') {
-      this.kickQueue(st);
+    // As at start, one record that trips recovery costs that thread its
+    // recovery, not the handover (Runner.recoveryFailed).
+    try {
+      if (rec.asked === undefined && !rec.archivedAt) this.backfillAsked(rec);
+      this.recoverReviews(st);
+      // Handed over before its worktree cleanup finished (letGo's limit).
+      void this.settleLostCleanups([st], false);
+      if (opts.crashed) {
+        // main.ts carries it on (carryOnStopped), after any resume of its own.
+        if (this.recover(st)) this.notice('info', `The old runner stopped while "${rec.title}" was mid-turn.`);
+      }
+      // Hibernating until the runner restarts: for this thread, coming across
+      // is the restart.
+      if (this.wakesOnStart(rec)) this.wake(st, 'restart');
+      else if (rec.queue.length && this.bucket(rec) === 'inbox') {
+        this.kickQueue(st);
+      }
+    } catch (e) {
+      this.recoveryFailed(st, e);
     }
     this.tellOneStoppedWork(st);
     this.markDirty(st);

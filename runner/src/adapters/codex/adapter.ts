@@ -85,7 +85,8 @@ export type CodexAdapterDeps = {
   // A runner.notice warning (configWarning: a broken config.toml).
   onNotice?: (text: string) => void;
   // More developer instructions for a new thread with tools, read at its
-  // start (an experiment's line, RICH_BLOCKS_LINE).
+  // start (RICH_BLOCKS_LINE, which the in-process server has in its own
+  // instructions).
   extraGuidance?: () => string;
   timings?: Partial<CodexTimings>;
   maxLineBytes?: number;
@@ -292,11 +293,13 @@ export function turnPolicy(mode: PermissionMode): Pick<TurnStartParams, 'approva
 
 // Sent on thread/start and on every resume: the rollout doesn't keep config
 // overrides (spike 3).
-export function threadConfig(threadId: string): Record<string, unknown> {
+export function threadConfig(threadId: string, key?: string): Record<string, unknown> {
   return {
     // Adds to config.toml's own [shell_environment_policy.set] rather than
-    // replacing it (spike 3), so the commands Codex runs know their thread.
+    // replacing it (spike 3), so the commands Codex runs know their thread
+    // and tb in them is limited to it (docs/protocol.md, "A thread's own key").
     'shell_environment_policy.set.THREADBEAR_THREAD_ID': threadId,
+    ...(key ? { 'shell_environment_policy.set.THREADBEAR_THREAD_KEY': key } : {}),
     'tools.update_plan.enabled': true,
     mcp_optional_startup_grace_ms: 10000,
     // Without it every thread notes "Under-development features enabled:
@@ -478,6 +481,7 @@ export class CodexSession implements AgentSession {
       runsAsCode: (file) => runsAsCodeByName(file) || (opts.runsAsCode?.(file) ?? false),
       callTool: (params, o) => this.tools.call(params, o),
       now: this.now,
+      fullAccess: () => this.mode === 'full',
     });
     this.proc.onNotification = (method, params) => this.enqueue(() => this.route(method, params));
     this.proc.onRequest = (id, method, params) => this.enqueue(() => this.request(id, method, params));
@@ -517,7 +521,7 @@ export class CodexSession implements AgentSession {
       ...threadPolicy(this.mode),
       // The thread's projects, as developer instructions: config.toml's
       // own key, set per thread like the rest of threadConfig.
-      config: { ...threadConfig(opts.threadId), ...(opts.instructions ? { developer_instructions: opts.instructions } : {}) },
+      config: { ...threadConfig(opts.threadId, opts.env?.THREADBEAR_THREAD_KEY), ...(opts.instructions ? { developer_instructions: opts.instructions } : {}) },
     };
     let res: ThreadStartResponse;
     if (opts.resume) {
@@ -1096,6 +1100,7 @@ export class CodexSession implements AgentSession {
     if (turn.own) r.own = true;
     else if (turn.ids.length) r.answers = turn.ids[0];
     if (answered.length || !turn.own) r.answered = answered;
+    if (turn.dropped.length) r.unreceived = [...turn.dropped];
     r.queuedTurns = this.held.length;
     this.sink.output({ kind: 'result', result: r });
   }
@@ -1175,14 +1180,14 @@ export class CodexSession implements AgentSession {
     if (turn) turn.steerQueue = [];
     if (!turn) {
       // Still starting, or held behind start: nothing reached Codex.
-      if (dropped.length) this.sink.output({ kind: 'result', result: { outcome: 'interrupted', durationMs: 0, answers: dropped[0], answered: dropped, queuedTurns: 0 } });
+      if (dropped.length) this.sink.output({ kind: 'result', result: { outcome: 'interrupted', durationMs: 0, answers: dropped[0], answered: dropped, unreceived: dropped, queuedTurns: 0 } });
       return;
     }
     if (turn.interruptRequested) {
       // A second Stop while the old turn finishes: the messages waiting
       // behind it belonged to a newer runner turn, which ends now.
       this.clearWaitTimers();
-      if (dropped.length) this.sink.output({ kind: 'result', result: { outcome: 'interrupted', durationMs: 0, answers: dropped[0], answered: dropped, queuedTurns: 0 } });
+      if (dropped.length) this.sink.output({ kind: 'result', result: { outcome: 'interrupted', durationMs: 0, answers: dropped[0], answered: dropped, unreceived: dropped, queuedTurns: 0 } });
     } else {
       turn.interruptRequested = true;
       turn.dropped.push(...dropped);

@@ -1,6 +1,6 @@
 // Experiments (src/experiments.ts): each new feature still being tried
 // out is off by default, with a switch in runner.json, and names the
-// schedule that asks Mike whether to turn it on for everyone (AGENTS.md,
+// schedule that asks Alex whether to turn it on for everyone (AGENTS.md,
 // "Experiments"), so none is left half-on and forgotten.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -25,11 +25,11 @@ test('experiments: each has a unique id, a landing date, a title and the schedul
 
 test("experiments: runner.json's switch wins over the default, read afresh each time", () => {
   const home = tmpDir();
-  assert.equal(experimentOn(home, 'labReview'), false);
-  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ experiments: { labReview: true } }));
-  assert.equal(experimentOn(home, 'labReview'), true);
-  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ experiments: { labReview: 'yes' } }));
-  assert.equal(experimentOn(home, 'labReview'), false, 'only a true or false counts');
+  assert.equal(experimentOn(home, 'keepAwake'), false);
+  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ experiments: { keepAwake: true } }));
+  assert.equal(experimentOn(home, 'keepAwake'), true);
+  fs.writeFileSync(path.join(home, 'runner.json'), JSON.stringify({ experiments: { keepAwake: 'yes' } }));
+  assert.equal(experimentOn(home, 'keepAwake'), false, 'only a true or false counts');
 });
 
 test('experiments: every experimentOn in the runner names an experiment that has a file', () => {

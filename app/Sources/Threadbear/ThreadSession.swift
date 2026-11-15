@@ -113,9 +113,9 @@ final class ThreadSession {
     /// thread, then hands them to the view and subscribes.
     func open(width: CGFloat) {
         guard state == .idle || state.isFailed, loadTask == nil, let appModel = app else { return }
-        // Another runner's thread connects to its runner first, in the load
-        // below; this Mac's waits for the app's own connection, which
-        // opens it once it's up.
+        // Another runner's thread goes ahead and fails in the load below if
+        // this Mac's runner isn't connected, saying so; this Mac's waits for
+        // the app's own connection, which opens it once it's up.
         let remote = appModel.isRemote(threadId)
         guard remote || appModel.client != nil else { return }
         if let subagentId {
@@ -189,7 +189,7 @@ final class ThreadSession {
                 }
                 feed = ThreadFeed(model: model)
                 // Another runner's thread through Convex: its seqs have gaps.
-                feed.sparse = appModel.viaRelay(threadId)
+                feed.sparse = appModel.isRemote(threadId)
                 displayStart = prepared.1
                 state = .loaded
                 perfLog.endInterval("open", signpost)
@@ -303,26 +303,40 @@ final class ThreadSession {
     /// restart turned them away; a dropped connection keeps them showing.
     @ObservationIgnored private var resending: Set<String> = []
 
+    /// Held for the new runner: it stays through a dropped connection, and
+    /// its bubble says it goes when the runner's back.
     func holdForResend(_ id: String) {
-        if hasPending(id) { resending.insert(id) }
+        guard hasPending(id) else { return }
+        resending.insert(id)
+        updatePending { list in
+            if let index = list.firstIndex(where: { $0.id == id }) { list[index].waitingForRunner = true }
+        }
     }
 
-    /// Reads the thread again from scratch, when the way it's reached has
-    /// changed (the direct link went on or off).
-    func reload(width: CGFloat) {
-        guard subagentId == nil, loadTask == nil else { return }
-        // The caller has let the old subscription go, over the old way.
-        subscribed = false
-        feed = ThreadFeed()
-        displayStart = 0
-        state = .idle
-        view?.reloadAll()
-        open(width: width)
+    /// Sent while a restart is under way: a drop as the old runner closes
+    /// doesn't take its bubble away before the send hears of it and holds
+    /// it for the new runner (AppModel.post). No note under it yet.
+    func keepThroughDrop(_ id: String) {
+        guard hasPending(id) else { return }
+        resending.insert(id)
     }
 
-    /// Another runner's thread whose runner can't be reached any more: the
-    /// transcript goes and the reason shows in its place, with Try again,
-    /// rather than an old transcript that's quietly stopped updating.
+    /// Messages waiting to go again on a new runner: if the app quits
+    /// first, their words go in the box for next time (DraftStore).
+    var heldForResend: [PendingMessage] { pending.filter { resending.contains($0.id) } }
+
+    /// The new runner is up and it's going now: the spinner again, and
+    /// the note goes.
+    func sendingAgain(_ id: String) {
+        updatePending { list in
+            if let index = list.firstIndex(where: { $0.id == id }), list[index].waitingForRunner { list[index].waitingForRunner = false }
+        }
+    }
+
+    /// Another runner's thread that can't be reached any more (this Mac's
+    /// runner, which it goes through, isn't connected): the transcript goes
+    /// and the reason shows in its place, with Try again, rather than an old
+    /// transcript that's quietly stopped updating.
     func markUnreachable(_ error: Error) {
         guard subagentId == nil, loadTask == nil else { return }
         subscribed = false

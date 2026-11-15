@@ -20,7 +20,7 @@ test('effort levels include ultra and providers include codex', () => {
   assert.ok(isEffortLevel('ultra'));
   assert.ok(!isEffortLevel('extreme'));
   assert.ok(isProvider('codex') && isProvider('claude'));
-  assert.ok(!isProvider('grok'));
+  assert.ok(isProvider('grok') && !isProvider('gemini'));
 });
 
 test('config: the step 4 settings default safely', () => {
@@ -30,8 +30,8 @@ test('config: the step 4 settings default safely', () => {
   assert.deepEqual(cfg.codexArgs, []);
   assert.ok(cfg.codexMainDir.endsWith('/.codex'));
   assert.ok(cfg.tokenStatsLimitsFile.endsWith('/Token Stats/limits.json'));
-  assert.deepEqual(cfg.cliUpdates, { claude: 'auto', codex: 'auto', checkMinutes: 60, keepCodexVersions: 2 });
-  // Nobody's notes or pool folders by default: Mike's are in his runner.json.
+  assert.deepEqual(cfg.cliUpdates, { claude: 'auto', codex: 'auto', checkMinutes: 60, keepCodexVersions: 2, extra: [] });
+  // Nobody's notes or pool folders by default: Alex's are in his runner.json.
   assert.deepEqual(cfg.accountNotes, {});
   assert.deepEqual(cfg.poolFolders, {});
   assert.notEqual(cfg.accountNotes, DEFAULT_ACCOUNT_NOTES, 'a copy, so nobody edits the default');
@@ -47,12 +47,12 @@ test('config: runner.json and env set the step 4 settings', () => {
       defaults: {
         cwd: '/tmp',
         model: 'claude-haiku-5-5',
-        models: { codex: ' gpt-6-luna ', claude: '', grok: 'x' },
+        models: { codex: ' gpt-6-luna ', claude: '', gemini: 'x' },
         efforts: { codex: 'low', claude: 'extreme' },
       },
       codexPath: '~/bin/codex',
       codexArgs: ['-c', 'features.memories=false', 3],
-      cliUpdates: { codex: 'notify', claude: 'sometimes', checkMinutes: 15, keepCodexVersions: 1 },
+      cliUpdates: { codex: 'notify', claude: 'sometimes', checkMinutes: 15, keepCodexVersions: 1, extra: [{ name: 'grok', command: ['grok', 'update'] }, { name: 'bad', command: 'grok update' }] },
       accountNotes: { 'claude-3': 'Tests', 'claude-1': 4 },
     }),
   );
@@ -62,7 +62,7 @@ test('config: runner.json and env set the step 4 settings', () => {
   assert.deepEqual(cfg.defaults.efforts, { codex: 'low' });
   assert.ok(cfg.codexPath?.endsWith('/bin/codex') && !cfg.codexPath.startsWith('~'));
   assert.deepEqual(cfg.codexArgs, ['-c', 'features.memories=false']);
-  assert.deepEqual(cfg.cliUpdates, { claude: 'auto', codex: 'notify', checkMinutes: 15, keepCodexVersions: 2 });
+  assert.deepEqual(cfg.cliUpdates, { claude: 'auto', codex: 'notify', checkMinutes: 15, keepCodexVersions: 2, extra: [{ name: 'grok', command: ['grok', 'update'] }] });
   assert.deepEqual(cfg.accountNotes, { 'claude-3': 'Tests' }, "runner.json's notes replace the default ones");
 
   const env = loadConfig({
@@ -132,7 +132,7 @@ test('protocol check: accounts with usage, notes and Codex models', () => {
     },
   };
   assert.deepEqual(checkAccount(account), []);
-  assert.deepEqual(checkAccount({ id: 'claude-2', provider: 'claude', title: 'x', configDir: '/x', note: 'Convex work only' }), []);
+  assert.deepEqual(checkAccount({ id: 'claude-2', provider: 'claude', title: 'x', configDir: '/x', note: 'Work only' }), []);
   assert.deepEqual(checkAccount({ ...account, defaultEffort: 'extreme' }), ['defaultEffort']);
   assert.deepEqual(checkAccount({ ...account, usage: { ...account.usage, source: 'guess' } }), ['usage.source']);
   assert.deepEqual(

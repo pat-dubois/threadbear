@@ -69,8 +69,10 @@ extension AppModel {
     func newThreadRequest(text: String, images: [ImageRef]) -> NewThreadRequest {
         // This Mac's logins, or the chosen runner's for a draft on it.
         let logins = draftLogins
-        let ask = newThreadPermission
-        // Another runner that hasn't said hello yet: its own defaults,
+        // `.unknown` is the runner's own default, a mode this app doesn't
+        // know: left out, the runner starts the thread on exactly that.
+        let ask: PermissionMode? = newThreadPermission == .unknown ? nil : newThreadPermission
+        // Another runner whose logins haven't come yet: its own defaults,
         // in the folder typed for it if any (the runner checks it).
         if newThreadRunnerId != nil, newThreadLogins == nil {
             return NewThreadRequest(text: text, images: images, cwd: newThreadCwd, permissionMode: ask)

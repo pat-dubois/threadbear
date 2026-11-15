@@ -26,7 +26,23 @@ public struct WorkedTurn: Hashable, Sendable {
 /// "Needs you", "The summary"): Mike's message, one line of work, then the
 /// reply. The phone has a small screen, so this matters more here.
 public enum Turns {
+    /// A thread's items, with each login's note (role `note`) where it
+    /// happened: after what was on show before it and before the first
+    /// reply after it. The notes are taken out first, so a turn folds and
+    /// picks its reply as if they weren't there, as the Mac keeps them out
+    /// of its line of work. `web/src/turns.ts` does the same.
     public static func fold(_ messages: [PhoneMessage], busy: Bool) -> [ThreadItem] {
+        let notes = messages.filter { $0.role == .note }
+        guard !notes.isEmpty else { return foldTurns(messages, busy: busy) }
+        var out = foldTurns(messages.filter { $0.role != .note }, busy: busy)
+        for note in notes {
+            let at = out.firstIndex { ($0.placedSeq ?? .min) > note.seq } ?? out.count
+            out.insert(.note(note), at: at)
+        }
+        return out
+    }
+
+    static func foldTurns(_ messages: [PhoneMessage], busy: Bool) -> [ThreadItem] {
         // A turn starts at a message from Mike, the phone, a schedule or
         // another agent; one the runner sent (a restart, a resume) joins the
         // turns before it, as on the Mac.
@@ -45,7 +61,11 @@ public enum Turns {
                 out += shownWhole(body)
                 continue
             }
-            let reply = replies(body)
+            // A plan stays out of the fold wherever it is in the turn: it's
+            // what Go ahead approves, and a sent-back one is what he asked
+            // to change.
+            let replyOnly = replies(body)
+            let reply = replyOnly.isEmpty ? [] : Array(Set(replyOnly).union(body.indices.filter { body[$0].plan }))
             if reply.isEmpty {
                 out += shownWhole(body)
                 continue
@@ -176,13 +196,23 @@ public enum Turns {
         return []
     }
 
+    /// The last message the thread view shows: a row for one of
+    /// Threadbear's own tools (end_turn above all) or ToolSearch isn't one.
+    /// An agent that writes its reply and then calls end_turn ends on that
+    /// tool's row, and the done card went by the very last row, so it never
+    /// showed there while the Mac and the website did (the parity run, 9 Nov).
+    public static func lastShown(_ messages: [PhoneMessage]) -> PhoneMessage? {
+        // Nor a login's note: it's the runner's line, after the reply.
+        messages.last { $0.role != .note && ($0.role != .tool || isStep($0)) }
+    }
+
     /// A step of work: a tool call outside Threadbear's own tools and
     /// ToolSearch (which say nothing Mike has to read), or a message sent
     /// into the turn.
     static func isStep(_ m: PhoneMessage) -> Bool {
         switch m.role {
         case .user: true
-        case .assistant: false
+        case .assistant, .note: false
         case .tool: !(m.text.hasPrefix("threadbear: ") || m.text.hasPrefix("Find tools: "))
         }
     }
@@ -195,17 +225,22 @@ public struct PhoneAsk: Codable, Sendable, Hashable {
     /// The words the agent wants back once it's done ("done").
     public var reply: String?
     public var options: [String]?
+    /// What each option does, one per option (backend API 61), as the Mac
+    /// draws under each answer. The parity run found the phone drawing bare
+    /// chips without them (9 Nov).
+    public var optionNotes: [String]?
     /// The agent's own pick, an index into options (a Convex number).
     public var suggested: Double?
     /// Web pages to go to; files on the Mac never come to the phone.
     public var links: [PhoneAskLink]?
     public var ticked: Bool?
 
-    public init(action: String, why: String? = nil, reply: String? = nil, options: [String]? = nil, suggested: Double? = nil, links: [PhoneAskLink]? = nil, ticked: Bool? = nil) {
+    public init(action: String, why: String? = nil, reply: String? = nil, options: [String]? = nil, optionNotes: [String]? = nil, suggested: Double? = nil, links: [PhoneAskLink]? = nil, ticked: Bool? = nil) {
         self.action = action
         self.why = why
         self.reply = reply
         self.options = options
+        self.optionNotes = optionNotes
         self.suggested = suggested
         self.links = links
         self.ticked = ticked
@@ -232,6 +267,17 @@ public struct PhoneAsk: Codable, Sendable, Hashable {
         if let reply = reply?.trimmingCharacters(in: .whitespacesAndNewlines), !reply.isEmpty { return [reply] }
         return []
     }
+
+    /// What choosing `choice` does, when the agent said: only for its
+    /// options, and only when there's a note for each.
+    public func note(_ choice: Int) -> String? {
+        guard let options, !options.isEmpty, let notes = optionNotes, notes.count == options.count, notes.indices.contains(choice) else { return nil }
+        let note = notes[choice].trimmingCharacters(in: .whitespacesAndNewlines)
+        return note.isEmpty ? nil : note
+    }
+
+    /// Whether any option says what it does: the card then draws rows, as the Mac does.
+    public var hasNotes: Bool { (0..<choices.count).contains { note($0) != nil } }
 
     /// The agent's pick, as a Convex number: one that isn't a whole index
     /// is none (Int(_:) of 1e100 traps).
@@ -286,6 +332,23 @@ public struct AskAnswer: Codable, Sendable, Hashable {
         asks.enumerated().compactMap { i, ask in
             guard let n = picks[i], ask.choices.indices.contains(n) else { return nil }
             return (i, AskAnswer(action: ask.action, answer: ask.choices[n]))
+        }
+    }
+}
+
+extension ThreadItem {
+    /// Where an item sits among the thread's rows, for placing a note. A
+    /// turn's folded work has no place of its own: its line goes above the
+    /// turn's replies whichever rows it holds, so a login that ran out
+    /// before doing anything put the note above the limit's own words, by
+    /// the work that came after (Codex's review, 13 Nov). The note goes by
+    /// the messages instead. A divider goes with the row after it.
+    var placedSeq: Int? {
+        switch self {
+        case let .message(m), let .note(m): m.seq
+        case let .tools(items): items.first?.seq
+        case .worked: nil
+        case let .gap(g): g.seq
         }
     }
 }

@@ -1,0 +1,175 @@
+// One app, on its own mock runner, for each scenario.
+import { After, Before, setDefaultTimeout, setWorldConstructor, Status, World, type IWorldOptions } from '@cucumber/cucumber';
+import fs from 'node:fs';
+import path from 'node:path';
+import { StandInBrowserBear } from './browserbear.ts';
+import { sleep, type Driver, type Dump, type Row, type Thread } from './driver.ts';
+import { GpuiDriver } from './gpui.ts';
+import { longThreadFolder } from './long-thread.ts';
+import { SwiftDriver } from './swift.ts';
+import { removeTempFolders, tempFolder } from './temp.ts';
+import { webRuntimeCleanup, webRuntimeSetup } from './web-runtime.ts';
+
+// Whatever a person running the specs asked for (features/README.md), kept
+// apart from the long-thread scenarios setting it for themselves.
+const startingFixtures = process.env.TB_MOCK_FIXTURES;
+const startingScriptedTurns = process.env.MOCK_SCRIPTED_TURNS;
+
+setDefaultTimeout(90_000);
+
+export class ThreadbearWorld extends World {
+  app: Driver;
+  /** Remove a scenario's files only after the app and its shells have ended. */
+  /** What the last right-click on a sidebar row offered. */
+  menuTitles?: string[];
+  /** What the last command answered, for a step to read back. */
+  lastAnswer?: string;
+  /** The row a swipe under way is on (swipes.steps.ts). */
+  swipedRow?: string;
+  /** A row's position a scenario wants to compare with later. */
+  notedIndex?: number;
+  /** A row and its height, a scenario wants to compare with later. */
+  notedRow?: { id: string; height: number };
+  /** What the last `share` command said. */
+  shareResult?: string;
+  /** The thread whose page flew to its heading (archive-flight.steps.ts). */
+  flownFrom?: string;
+  /** A stand-in BrowserBear, for @browserbear scenarios (support/browserbear.ts). */
+  bear?: StandInBrowserBear;
+
+  constructor(options: IWorldOptions) {
+    super(options);
+    this.app = (process.env.TB_APP ?? 'gpui') === 'swift' ? new SwiftDriver() : new GpuiDriver();
+  }
+
+  /** Waits until a dump passes `check` (it's slow to land, as everything is). */
+  async until<T>(what: string, check: (d: Dump) => T | undefined | false | null, ms = 15_000): Promise<T> {
+    const deadline = Date.now() + ms;
+    let last: Dump | undefined;
+    for (;;) {
+      last = await this.app.dump();
+      const got = check(last);
+      if (got) return got;
+      if (Date.now() > deadline) throw new Error(`Never saw: ${what}\n\n${describe(last)}`);
+      await sleep(120);
+    }
+  }
+
+  thread(d: Dump, title: string): Thread | undefined {
+    for (const s of d.sidebar.sections) {
+      // Or nested under the thread that started it, in its open group.
+      const t = s.threads.find((x) => x.title === title) ?? s.threads.flatMap((x) => x.group?.threads ?? []).find((x) => x.title === title);
+      if (t) return t;
+    }
+    return undefined;
+  }
+
+  /** Waits for a sidebar row with that title, wherever it is, and opens it. */
+  async open(title: string): Promise<Thread> {
+    const t = await this.until(`a thread called "${title}"`, (d) => this.thread(d, title));
+    await this.app.do({ cmd: 'open', id: t.id });
+    await this.until(`"${title}" open with its rows on screen`, (d) => d.selection?.id === t.id && d.transcript.threadId === t.id && d.transcript.state === 'loaded');
+    return t;
+  }
+}
+
+/** A short account of what the app showed, for a failure message. */
+export function describe(d: Dump): string {
+  const side = d.sidebar.sections.map((s) => `${s.name}${s.collapsed ? ' (folded)' : ''}: ${s.threads.map((t) => t.title).join(' | ') || '(none)'}`).join('\n');
+  const rows = d.transcript.rows.map((r: Row) => `  ${r.kind}${r.expanded ? ' (open)' : ''}: ${r.text}`).join('\n');
+  return `${d.reduceMotion ? 'Reduce Motion: on\n' : ''}connection: ${d.connection}\nbanner: ${d.banner?.text ?? '(none)'}\n${side}\nopen: ${d.selection?.title ?? '(none)'}, composer: ${JSON.stringify(d.composer.text)}\n${rows}`;
+}
+
+setWorldConstructor(ThreadbearWorld);
+
+// A pin request must survive other pane updates while its highlights arrive.
+Before({ tags: '@panel.requests and @highlights.pinned' }, () => {
+  process.env.THREADBEAR_MOCK_HIGHLIGHTS_DELAY_MS = '5000';
+});
+After({ tags: '@panel.requests and @highlights.pinned' }, () => {
+  delete process.env.THREADBEAR_MOCK_HIGHLIGHTS_DELAY_MS;
+});
+
+// The loading rows only show while the list is on its way, so that scenario's
+// mock answers late. Before the app starts, hence above the Before below.
+Before({ tags: '@sidebar.skeleton' }, () => {
+  process.env.THREADBEAR_MOCK_LIST_DELAY_MS = '9000';
+  process.env.TB_DEV_APP_NO_READY = '1';
+});
+After({ tags: '@sidebar.skeleton' }, () => {
+  delete process.env.THREADBEAR_MOCK_LIST_DELAY_MS;
+  delete process.env.TB_DEV_APP_NO_READY;
+});
+
+// A runner slow to read a thread (switching-threads.feature).
+Before({ tags: '@thread.loading or @thread.kept' }, () => {
+  process.env.THREADBEAR_MOCK_EVENTS_DELAY_MS = '3000';
+});
+After({ tags: '@thread.loading or @thread.kept' }, () => {
+  delete process.env.THREADBEAR_MOCK_EVENTS_DELAY_MS;
+});
+
+// A real mock turn that can be interrupted while its picture is loading.
+// Seeded "running" rows have no executing turn for Stop to interrupt.
+Before({ tags: '@picture-loading' }, () => {
+  const file = path.join(tempFolder('threadbear-picture-turn-'), 'turns.json');
+  fs.writeFileSync(file, JSON.stringify([{ match: '^Hold the turn for picture input$', reply: 'Still working. '.repeat(100), chunk: 1, chunkMs: 250 }]));
+  process.env.MOCK_SCRIPTED_TURNS = file;
+});
+After({ tags: '@picture-loading' }, () => {
+  if (startingScriptedTurns === undefined) delete process.env.MOCK_SCRIPTED_TURNS;
+  else process.env.MOCK_SCRIPTED_TURNS = startingScriptedTurns;
+});
+
+Before(async function (this: ThreadbearWorld, { pickle }) {
+  // A scenario about paging needs a thread longer than one page of events.
+  const long = pickle.tags.some((t) => t.name === '@long-thread');
+  if (long) process.env.TB_MOCK_FIXTURES = longThreadFolder();
+  else if (startingFixtures === undefined) delete process.env.TB_MOCK_FIXTURES;
+  // A scenario about other machines needs the mock's mac-mini threads, which
+  // both drivers leave out otherwise (TB_MOCK_NO_REMOTE in gpui.ts, swift.ts).
+  if (pickle.tags.some((t) => t.name === '@remote-threads')) process.env.TB_MOCK_REMOTE = '1';
+  else delete process.env.TB_MOCK_REMOTE;
+  // Decisions on the Projects page: the mock's cards of asks in Threadbear,
+  // and the projectDecisions experiment on in its hello.
+  if (pickle.tags.some((t) => t.name === '@project-decisions')) process.env.TB_MOCK_DECISIONS = '1';
+  else delete process.env.TB_MOCK_DECISIONS;
+  // Open Anything's experiment off: the mock's hello leaves it out.
+  if (pickle.tags.some((t) => t.name === '@open-anything-off')) process.env.TB_MOCK_OPEN_ANYTHING_OFF = '1';
+  else delete process.env.TB_MOCK_OPEN_ANYTHING_OFF;
+  // Nested threads: the mock's coordinator and the threads it started, with
+  // the nestedThreads experiment on, or off with @nested-threads-off.
+  const nestedOff = pickle.tags.some((t) => t.name === '@nested-threads-off');
+  if (nestedOff || pickle.tags.some((t) => t.name === '@nested-threads')) process.env.TB_MOCK_NESTED = '1';
+  else delete process.env.TB_MOCK_NESTED;
+  if (nestedOff) process.env.TB_MOCK_NESTED_OFF = '1';
+  else delete process.env.TB_MOCK_NESTED_OFF;
+  // Parts of a project: Photo sync as a part of Threadbear.
+  if (pickle.tags.some((t) => t.name === '@project-parts')) process.env.TB_MOCK_PARTS = '1';
+  else delete process.env.TB_MOCK_PARTS;
+  // A stand-in BrowserBear, its folder handed to the app. Without the tag the
+  // app has none: a scripted app never reaches the real one.
+  if (pickle.tags.some((t) => t.name === '@browserbear')) {
+    this.bear = await StandInBrowserBear.start();
+    process.env.BROWSERBEAR_HOME = this.bear.home;
+  } else delete process.env.BROWSERBEAR_HOME;
+  // The web runtime's folder for this scenario (support/web-runtime.ts).
+  if ((await webRuntimeSetup(pickle.tags.map((t) => t.name))) === 'skipped') return 'skipped';
+  await this.app.start();
+});
+
+After(async function (this: ThreadbearWorld, { result, pickle }) {
+  if (result?.status === Status.FAILED) {
+    const dir = path.resolve('reports/failures');
+    fs.mkdirSync(dir, { recursive: true });
+    const name = pickle.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase();
+    const file = path.join(dir, `${this.app.name}-${name}.png`);
+    await this.app.shot(file).catch(() => {});
+    if (fs.existsSync(file)) this.attach(fs.readFileSync(file), 'image/png');
+  }
+  await this.app.stop();
+  await this.bear?.stop();
+  // Only now: Windows won't remove the folder the Terminal's shell is in.
+  removeTempFolders();
+  webRuntimeCleanup();
+});

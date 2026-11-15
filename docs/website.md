@@ -93,7 +93,10 @@ preview. With Mike's token it also answers while the
 thread isn't shared, with `manage`, so his page keeps its controls.
 
 Pictures are in file storage (`shareImages`), uploaded by the runner only
-while the thread is shared and dropped when it stops, and only real
+while the thread is shared and dropped when it stops, and served to
+anyone with the link through `/share/image/<slug>/<id>` (`convex/http.ts`),
+which checks at every request that the thread is still shared under that
+link, so a saved picture URL stops with the share, and only real
 pictures from the thread's media folder (attachments, tool pictures, and
 what the agent copies into `THREADBEAR_MEDIA_DIR`), never its working
 folder or a temp folder (docs/protocol.md, "Sharing"). A picture written in
@@ -145,6 +148,9 @@ npm run web:deploy`). For a site-only change,
 `npx static-hosting upload --build --build-command 'npm run web:build' --dist web/dist --prod`.
 A plain `npm run web:build` refuses to run without `VITE_CONVEX_URL`, which
 the static-hosting CLI sets: a build without it can't reach Convex.
+In a thread's worktree there's no `.env.local` (it isn't in git), and the
+upload says it "Could not reach component staticHosting": copy the main
+checkout's in for the upload and delete it after.
 
 ## Not done
 

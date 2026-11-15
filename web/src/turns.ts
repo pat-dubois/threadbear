@@ -7,11 +7,15 @@ import type { MessageButton } from './reply-buttons';
 
 export type TurnMessage = {
   seq: number;
-  role: 'user' | 'assistant' | 'tool';
+  // "note": the line a thread writes when its login runs out and it moves
+  // to another or waits for room (backend API 79, asked for with `notes`).
+  role: 'user' | 'assistant' | 'tool' | 'note';
   text: string;
   origin?: string;
   toolKind?: string;
   summary?: boolean;
+  // A Plan first plan in full (API 72).
+  plan?: boolean;
   turn?: string;
   // The reply buttons its text links (API 59, reply-buttons.ts).
   buttons?: MessageButton[];
@@ -21,7 +25,13 @@ export type TurnMessage = {
 export type Item<M extends TurnMessage = TurnMessage> =
   | { kind: 'message'; m: M }
   | { kind: 'tools'; items: M[] }
-  | { kind: 'worked'; items: Item<M>[]; ms?: number; key: number };
+  | { kind: 'worked'; items: Item<M>[]; ms?: number; key: number }
+  // A login's note: a quiet line of its own, never folded into the work.
+  | { kind: 'note'; m: M };
+
+export function isNote(m: TurnMessage): boolean {
+  return m.role === 'note';
+}
 
 // Tool calls between two messages go together as one run.
 export function group<M extends TurnMessage>(messages: M[]): Item<M>[] {
@@ -42,7 +52,34 @@ export function startsTurn(m: TurnMessage): boolean {
   return m.role === 'user' && m.origin !== 'runner';
 }
 
+// A thread's items, with each login's note where it happened: after what
+// was on show before it and before the first reply after it. The notes are
+// taken out first, so a turn folds and picks its reply as if they weren't
+// there (nothing else here knows the role), as the Mac keeps them out of
+// its line of work.
 export function fold<M extends TurnMessage>(messages: M[], busy: boolean): Item<M>[] {
+  const notes = messages.filter(isNote);
+  if (!notes.length) return foldTurns(messages, busy);
+  const out = foldTurns(messages.filter((m) => !isNote(m)), busy);
+  for (const m of notes) {
+    const at = out.findIndex((item) => (placedSeq(item) ?? -Infinity) > m.seq);
+    out.splice(at < 0 ? out.length : at, 0, { kind: 'note', m });
+  }
+  return out;
+}
+
+// Where an item sits among the thread's rows, for placing a note. A turn's
+// folded work has no place of its own: its line goes above the turn's
+// replies whichever rows it holds, so a login that ran out before doing
+// anything put the note above the limit's own words, by the work that came
+// after (Codex's review, 13 Nov). The note goes by the messages instead.
+function placedSeq(item: Item): number | undefined {
+  if (item.kind === 'worked') return undefined;
+  if (item.kind === 'tools') return item.items[0]?.seq;
+  return item.m.seq;
+}
+
+function foldTurns<M extends TurnMessage>(messages: M[], busy: boolean): Item<M>[] {
   const turns: M[][] = [[]];
   for (const m of messages) {
     if (startsTurn(m) && turns.at(-1)!.length) turns.push([]);
@@ -59,7 +96,11 @@ export function fold<M extends TurnMessage>(messages: M[], busy: boolean): Item<
       out.push(...group(body));
       return;
     }
-    const reply = replies(body);
+    // A plan stays out of the fold wherever it is in the turn, as on the
+    // phone: it's what Go ahead approves, and a sent-back one is what Mike
+    // asked to change.
+    const replyOnly = replies(body);
+    const reply = replyOnly.length ? [...new Set([...replyOnly, ...body.flatMap((m, j) => (m.plan ? [j] : []))])] : [];
     if (!reply.length) {
       out.push(...group(body));
       return;
@@ -164,7 +205,7 @@ export function splitTurns<M extends TurnMessage>(messages: M[]): Turn<M>[] {
   for (const t of out) {
     // To the last thing said, as fold times a turn to its reply, not to a
     // tool line after it (end_turn).
-    const last = [...t.messages].reverse().find((m) => m.role !== 'tool');
+    const last = [...t.messages].reverse().find((m) => m.role !== 'tool' && m.role !== 'note');
     if (t.starter && last && last !== t.starter) t.ms = Date.parse(last.at) - Date.parse(t.starter.at);
   }
   return out;

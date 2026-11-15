@@ -116,7 +116,7 @@ test('a background subagent asking for approval after its turn ended keeps the r
   void s.sink.requestApproval({ name: 'Write', title: 'Write x', input: {}, canAlwaysAllow: false, signal: new AbortController().signal });
   assert.equal(h.runner.get(thread.id).status, 'waiting');
   assert.deepEqual(r.request({}).waitingFor, [thread.id]);
-  // It waits on Mike, not on the thread finishing, and says so.
+  // It waits on Alex, not on the thread finishing, and says so.
   assert.deepEqual(notices(h), ['The runner will restart when you answer 1 thread.']);
   assert.deepEqual(r.helloNotices(), [{ level: 'info', message: 'The runner will restart when you answer 1 thread.' }]);
   await tick();
@@ -691,7 +691,8 @@ test("cancelling a deploy's restart points current back at the running release",
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8')).lastGood, 'A', 'the rest is kept');
 
   // A restart that wasn't a deploy's leaves current alone.
-  fs.rmSync(path.join(dir, 'current'));
+  // A symlink to a directory: unlink it, rmSync refuses it (Node 24.12).
+  fs.unlinkSync(path.join(dir, 'current'));
   fs.symlinkSync(path.join('releases', 'B'), path.join(dir, 'current'));
   r.request({});
   assert.deepEqual(r.request({ cancel: true }), { scheduled: false, waitingFor: [] });
@@ -715,7 +716,7 @@ test('a runner stopped some other way while a restart waits counts as restarted 
   // T deploys at 0 and its restart waits for A's long turn.
   r.request({ resume: { threadId: t.id, text: 'check it' } });
   h.clock.advance(20 * MIN);
-  // Mike stops waiting: launchctl kickstart sends SIGTERM, and main.ts's stop.
+  // Alex stops waiting: launchctl kickstart sends SIGTERM, and main.ts's stop.
   r.stopping();
   assert.equal(saved(h).shutdownAt, new Date(h.clock.now()).toISOString());
   await h.runner.shutdown();
@@ -804,7 +805,7 @@ test('a thread someone has written in since it asked is not resumed over them', 
   s.init();
   r.request({ resume: { threadId: thread.id, text: 'Check that your change works, then carry on.' } });
   s.result();
-  // Mike: "stop, don't carry on". The restart still waits for the other thread.
+  // Alex: "stop, don't carry on". The restart still waits for the other thread.
   h.runner.send(thread.id, "stop, don't carry on");
   s.result();
   so.result();
@@ -984,6 +985,8 @@ test('every CLI gets THREADBEAR_THREAD_ID, THREADBEAR_HOME and THREADBEAR_RUNNER
   // Where a picture goes to be on the thread's shared page (docs/protocol.md, "Sharing").
   assert.equal(env.THREADBEAR_MEDIA_DIR, path.join(h.home, 'threads', thread.id, 'media'));
   assert.match(env.THREADBEAR_RUNNER_VERSION, /^\d+\.\d+\.\d+\+/);
+  // The Node it runs on, for the repo's scripts (scripts/find-node.sh).
+  assert.equal(env.THREADBEAR_NODE, process.execPath);
   // This runner's bin/ first, so a bare `tb` in the thread is its tb.
   assert.equal(env.PATH.split(':')[0], path.resolve(import.meta.dirname, '..', '..', 'bin'));
   assert.ok(fs.existsSync(path.join(env.PATH.split(':')[0], 'tb')));

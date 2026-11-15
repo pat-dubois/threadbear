@@ -1,6 +1,7 @@
 // node --test web/src/sections.test.ts
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { archived, archiveShown, build, clampWidth, hibernating, isFiltering, matches, neighbour, NO_FILTER, passes, placeChoices, readFolded, readOrder, readWidth, shows, SIDEBAR_DEFAULT, SIDEBAR_MIN, urgency, wakeLine, wakesOf, type ThreadRow } from './sections.ts';
 
 const NOW = Date.parse('2026-11-05T10:00:00Z');
@@ -66,7 +67,7 @@ test('Hibernating is soonest to wake first, back on restart last, each once', ()
 test('the inbox sorts by what needs Mike, newest or oldest', () => {
   const old = row({ lastActivityMs: NOW - 5000 });
   const failedRead = row({ status: 'error', lastActivityMs: NOW - 4000 });
-  const unread = row({ unread: true, lastActivityMs: NOW - 3000 });
+  const unread = row({ needsYou: true, unread: true, lastActivityMs: NOW - 3000 });
   const asked = row({ status: 'waiting', lastActivityMs: NOW - 2000 });
   const fresh = row({ lastActivityMs: NOW - 1000 });
   const all = [old, failedRead, unread, asked, fresh];
@@ -75,11 +76,25 @@ test('the inbox sorts by what needs Mike, newest or oldest', () => {
   assert.deepEqual(ids(build(all, NOW, none, 'oldest').inbox), ids([old, failedRead, unread, asked, fresh]));
 });
 
-test('urgency: a failure that is unread outranks a plain unread', () => {
-  assert.equal(urgency(row({ unread: true, status: 'error' })), 1);
-  assert.equal(urgency(row({ unread: true })), 2);
+test('urgency: a failure that wants Mike outranks a plain one', () => {
+  assert.equal(urgency(row({ needsYou: true, unread: true, status: 'error' })), 1);
+  assert.equal(urgency(row({ needsYou: true, unread: true })), 2);
   assert.equal(urgency(row({ status: 'stopped' })), 3);
   assert.equal(urgency(row()), 4);
+});
+
+// The cases the Mac and phone run too: one rule for all three
+// (app/Sources/ThreadbearCore/Threads/InboxUrgency.swift).
+test('urgency and the Needs you filter follow the shared cases', () => {
+  type Case = { name: string; thread: { status?: ThreadRow['status']; needsYou?: boolean; unread?: boolean; pendingReviews?: number }; urgency: number; counted: boolean };
+  const file = new URL('../../app/Tests/Fixtures/inbox-urgency-cases.json', import.meta.url);
+  const { cases } = JSON.parse(readFileSync(file, 'utf8')) as { cases: Case[] };
+  assert.ok(cases.length >= 9);
+  for (const c of cases) {
+    const r = row({ status: c.thread.status ?? 'idle', needsYou: c.thread.needsYou ?? false, unread: c.thread.unread ?? false, ...(c.thread.pendingReviews ? { pendingReviews: c.thread.pendingReviews } : {}) });
+    assert.equal(urgency(r), c.urgency, c.name);
+    assert.equal(passes(r, { show: 'needsYou' }, NOW), c.counted, c.name);
+  }
 });
 
 test('stars stay in the order they were starred', () => {
@@ -111,17 +126,17 @@ test('filters pick out what needs Mike, unread, shared, and a place', () => {
   const unread = row({ unread: true });
   const shared = row({ share: { access: 'link' } });
   const stopped = row({ share: { access: 'none' } });
-  const inProject = row({ projects: [{ id: 'p', title: 'Poddle' }] });
+  const inProject = row({ projects: [{ id: 'p', title: 'Lantern' }] });
   const all = [asked, question, unread, shared, stopped, inProject];
   const of = (f: Parameters<typeof passes>[1]) => ids(all.filter((r) => passes(r, f)));
   assert.deepEqual(of(NO_FILTER), ids(all));
   assert.deepEqual(of({ show: 'needsYou' }), ids([asked, question]));
   assert.deepEqual(of({ show: 'unread' }), ids([unread]));
   assert.deepEqual(of({ show: 'shared' }), ids([shared]));
-  assert.deepEqual(of({ show: 'all', place: 'Poddle' }), ids([inProject]));
+  assert.deepEqual(of({ show: 'all', place: 'Lantern' }), ids([inProject]));
   assert.deepEqual(of({ show: 'unread', place: 'acme' }), ids([unread]));
   assert.ok(!isFiltering(NO_FILTER));
-  assert.ok(isFiltering({ show: 'all', place: 'Poddle' }));
+  assert.ok(isFiltering({ show: 'all', place: 'Lantern' }));
 });
 
 test('a thread put away never needs Mike or counts as unread', () => {
@@ -137,7 +152,7 @@ test('a thread put away never needs Mike or counts as unread', () => {
 });
 
 test('the open thread stays under a status filter, but not a search or another place', () => {
-  const read = row({ title: 'Read now', projects: [{ id: 'p', title: 'Poddle' }] });
+  const read = row({ title: 'Read now', projects: [{ id: 'p', title: 'Lantern' }] });
   assert.ok(!shows(read, '', { show: 'unread' }));
   assert.ok(shows(read, '', { show: 'unread' }, read.threadId));
   assert.ok(!shows(read, 'something else', { show: 'unread' }, read.threadId));
@@ -145,10 +160,10 @@ test('the open thread stays under a status filter, but not a search or another p
 });
 
 test('place choices count each thread once, most threads first', () => {
-  const dupe = row({ projects: [{ id: 'p', title: 'Poddle' }] });
-  const choices = placeChoices([dupe, dupe, row({ projects: [{ id: 'p', title: 'Poddle' }] }), row({ cwd: '/x/acme' })]);
+  const dupe = row({ projects: [{ id: 'p', title: 'Lantern' }] });
+  const choices = placeChoices([dupe, dupe, row({ projects: [{ id: 'p', title: 'Lantern' }] }), row({ cwd: '/x/acme' })]);
   assert.deepEqual(choices, [
-    { place: 'Poddle', count: 2 },
+    { place: 'Lantern', count: 2 },
     { place: 'acme', count: 1 },
   ]);
 });

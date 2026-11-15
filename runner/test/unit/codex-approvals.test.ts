@@ -18,6 +18,7 @@ import path from 'node:path';
 import { dynamicToolSpecs, NAMESPACE_DESCRIPTION_MAX, type ToolDefinition } from '../../src/adapters/codex/tools.ts';
 import { buildThreadbearTools } from '../../src/threadbear-mcp.ts';
 import { nullLogger } from '../../src/log.ts';
+import { remoteCardShowsAll } from '../../src/tools.ts';
 import type { QuestionAnswer, QuestionRequest, ToolApprovalAnswer, ToolApprovalRequest } from '../../src/adapters/types.ts';
 import type { CommandExecutionRequestApprovalParams } from '../../src/adapters/codex/types.ts';
 
@@ -169,7 +170,7 @@ test('refusals: cancel for approvals, decline for elicitations, -32601 otherwise
 
 // ---- The handler
 
-function harness(rules: string[] = []) {
+function harness(rules: string[] = [], o: { full?: () => boolean } = {}) {
   const replies: { id: unknown; result?: unknown; error?: { code: number; message: string } }[] = [];
   const asked: ToolApprovalRequest[] = [];
   const questions: QuestionRequest[] = [];
@@ -202,6 +203,7 @@ function harness(rules: string[] = []) {
     runsAsCode: (f) => f.includes('/.threadbear/'),
     callTool: async () => ({ contentItems: [{ type: 'inputText', text: 'ok' }], success: true }),
     now: () => 1_793_000_000_000,
+    ...(o.full ? { fullAccess: o.full } : {}),
   };
   const a = new CodexApprovals(deps);
   return {
@@ -241,6 +243,39 @@ test('command approvals: allow, deny and expire map to accept, decline and cance
     h.replies.map((r) => r.result),
     [{ decision: 'accept' }, { decision: 'decline' }, { decision: 'cancel' }],
   );
+});
+
+test('on Full access Codex never gets a card: commands, edits (code files too) and extra permissions are allowed (Ian, 13 Nov)', async () => {
+  let full = false;
+  const h = harness([], { full: () => full });
+  h.answerWith(async () => ({ decision: 'deny' }));
+  h.a.handle(0, 'item/commandExecution/requestApproval', req('touch b.txt'), { fromChild: false });
+  await flush();
+  assert.equal(h.asked.length, 1, 'asks till the thread is on Full');
+  // Switched to Full mid-turn: the rest of the turn asks nothing.
+  full = true;
+  h.a.handle(1, 'item/commandExecution/requestApproval', req('git diff --stat'), { fromChild: true });
+  h.a.handle(2, 'item/fileChange/requestApproval', { threadId: 'th', turnId: 'tu', itemId: 'fc-p', reason: null, grantRoot: null }, { fromChild: false });
+  h.a.handle(3, 'item/permissions/requestApproval', { threadId: 'th', turnId: 'tu', itemId: 'p-1', cwd: '/work/proj', reason: 'network', permissions: { network: { enabled: true } } }, { fromChild: false });
+  await flush();
+  assert.equal(h.asked.length, 1);
+  assert.deepEqual(h.replies.slice(1).map((r) => r.result), [{ decision: 'accept' }, { decision: 'accept' }, { permissions: { network: { enabled: true } }, scope: 'turn' }]);
+});
+
+test('every card here is one Full answers itself (fullAllows), and older request kinds ask nothing on Full either', async () => {
+  let full = false;
+  const h = harness([], { full: () => full });
+  h.answerWith((r) => new Promise((res) => r.signal.addEventListener('abort', () => res({ decision: 'expired' }))));
+  h.a.handle(7, 'item/commandExecution/requestApproval', req('touch b.txt'), { fromChild: false });
+  h.a.handle('x8', 'execCommandApproval', { conversationId: 't', callId: 'c1', command: ['touch', 'y'], cwd: '/w', reason: null }, { fromChild: false });
+  await flush();
+  assert.deepEqual(h.asked.map((r) => r.fullAllows), [true, true]);
+  full = true;
+  h.a.handle(10, 'execCommandApproval', { conversationId: 't', callId: 'c2', command: ['touch', 'z'], cwd: '/w', reason: null }, { fromChild: false });
+  h.a.handle(11, 'applyPatchApproval', { conversationId: 't', callId: 'c3', fileChanges: { '/home/me/.threadbear/patches/mine.ts': {} }, reason: null }, { fromChild: false });
+  await flush();
+  assert.equal(h.asked.length, 2);
+  assert.deepEqual(h.replies.map((r) => r.result), [{ decision: 'approved' }, { decision: 'approved' }]);
 });
 
 test('"Always allow" keeps a runner rule, answers the next match itself, and asks again for anything chained', async () => {
@@ -572,4 +607,13 @@ test("a legacy command only loses a wrapper that's the system's shell: a repo's 
   assert.equal(h.asked.length, 2);
   assert.equal(h.asked[1]!.canAlwaysAllow, false);
   assert.equal(unwrapShell("bash -lc 'ls'"), "bash -lc 'ls'");
+});
+
+test("a legacy rename's card names where it goes, so the phone can't allow it from one line (Codex review, 9 Nov 2026)", async () => {
+  const h = harness();
+  h.answerWith(async () => ({ decision: 'deny' }));
+  h.a.handle(0, 'applyPatchApproval', { conversationId: 't', callId: 'c', fileChanges: { '/w/notes.txt': { type: 'update', unified_diff: '', move_path: '/elsewhere/notes.txt' } }, reason: null }, { fromChild: false });
+  await flush();
+  assert.deepEqual(h.asked[0].input.paths, ['/w/notes.txt', '/elsewhere/notes.txt']);
+  assert.equal(remoteCardShowsAll('apply_patch', h.asked[0].input), false);
 });

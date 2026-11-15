@@ -1,6 +1,43 @@
 import AppKit
 import ThreadbearCore
 
+/// How a Markdown file shows in the panel: Preview draws it as a page
+/// (headings, lists, tables, pictures), Markdown is its raw text, ready to
+/// type in. The menu in the panel's bar switches one file and remembers the
+/// choice for the next (Wayne, 7 Nov: he wanted to read a `.md` like a doc,
+/// and to flip to its text from the same place).
+enum MarkdownView: String, CaseIterable {
+    case preview
+    case markdown
+
+    static let key = "filesMarkdownView"
+
+    static var current: MarkdownView {
+        get { UserDefaults.standard.string(forKey: key).flatMap(MarkdownView.init(rawValue:)) ?? .preview }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: key) }
+    }
+
+    var title: String {
+        switch self {
+        case .preview: "Preview"
+        case .markdown: "Markdown"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .preview: "doc.richtext"
+        case .markdown: "chevron.left.forwardslash.chevron.right"
+        }
+    }
+
+    /// Whether a file opens with its raw text up for typing: a Markdown
+    /// file once Markdown was the last pick. Anything else opens to read.
+    static func opensRaw(path: String, markdown: MarkdownView = current) -> Bool {
+        PreviewRules.isMarkdown(path) && markdown == .markdown
+    }
+}
+
 /// What a file link in the transcript can do, from its right-click menu.
 /// The menu also sets which one a plain click does.
 enum FileLinkAction: String, CaseIterable {
@@ -19,8 +56,8 @@ enum FileLinkAction: String, CaseIterable {
     }
 
     /// What a click on a file link in the transcript does: ⌘ always means
-    /// its app, and so does a project file on this Mac (a copy fetched from
-    /// another Mac has none of its media, so that's left to the pane).
+    /// its app, and so does a project file on this Mac (another Mac's is
+    /// left to the pane).
     static func forClick(on path: String, commandKey: Bool, remote: Bool, appFor: (URL) -> URL? = defaultApp) -> FileLinkAction {
         if commandKey { return .app }
         return !remote && opensInItsApp(path, appFor: appFor) ? .app : click
@@ -142,8 +179,11 @@ final class FileLinkMenu: NSObject {
 
     @objc private func copyPath() {
         guard let path else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(path, forType: .string)
+        // The app's pasteboard, as its other Copy items use: a scripted
+        // run's own, so a script's copies leave Mike's clipboard be.
+        let pasteboard = AppModel.shared.pasteboard
+        pasteboard.clearContents()
+        pasteboard.setString(path, forType: .string)
     }
 }
 
@@ -275,7 +315,8 @@ final class WebLinkMenu: NSObject {
     }
 
     @objc private func copyLink() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        let pasteboard = AppModel.shared.pasteboard
+        pasteboard.clearContents()
+        pasteboard.setString(url.absoluteString, forType: .string)
     }
 }

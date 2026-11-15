@@ -70,7 +70,9 @@ this Mac sleeps, and share links only opening on their tailnet
 (docs/self-hosting.md). If they still want it, check `docker info` works
 (**Ask** them to install and start Docker Desktop or OrbStack if not) and
 that `tailscale status` shows this Mac logged in (**Ask** them to install
-and log in to Tailscale if not). Then, in place of the commands above:
+and log in to Tailscale if not), to a tailnet of their own: setup puts the
+backend on whichever tailnet that is, so **Ask** if it looks like their
+work's. Then, in place of the commands above:
 
 ```sh
 ./threadbear setup --self-hosted --dry-run --yes
@@ -80,6 +82,39 @@ and log in to Tailscale if not). Then, in place of the commands above:
 No Convex login or team is needed. If it stops asking for HTTPS
 certificates or MagicDNS, **Ask** them to turn those on in the Tailscale
 admin console (DNS), then run it again.
+
+**If they won't use the phone, or can't use Tailscale** (their work keeps
+them on its own tailnet, and Tailscale only has one on at a time), add
+`--local`: the same backend on this Mac's 127.0.0.1 only, with no
+Tailscale at all. Say what that leaves out first: no iPhone app at all, no
+second Mac, and the website and share links only open on this Mac. Don't
+pick it for them because Tailscale is missing; ask which they want. Check
+`docker info` as above, then:
+
+```sh
+./threadbear setup --self-hosted --local --dry-run --yes
+./threadbear setup --self-hosted --local --yes
+```
+
+Running setup again later keeps it local. To move it onto a tailnet once
+they have Tailscale, `./threadbear setup --self-hosted --tailnet`; their
+threads stay.
+
+**If their phone already reaches this Mac their own way** (a reverse
+proxy such as Caddy or nginx, cloudflared, their own Tailscale or VPN),
+`--url` and `--site-url` take the two https addresses their proxy answers
+on, pointed at `127.0.0.1:13210` and `127.0.0.1:13211`, and setup leaves
+Tailscale alone. **Ask** them for both addresses; don't make them up or set
+up their proxy for them unless they ask. Check `docker info` as above, then:
+
+```sh
+./threadbear setup --self-hosted --url https://<their api address> --site-url https://<their site address> --dry-run --yes
+./threadbear setup --self-hosted --url https://<their api address> --site-url https://<their site address> --yes
+```
+
+If it stops because an address doesn't reach the backend, it says which
+one and from where (this Mac or inside Docker): pass that on, as it's
+their proxy or DNS to fix.
 
 If your own permission check refuses to run setup (Claude Code's auto mode
 does: it's a script you've just downloaded), that's its job, so don't try to
@@ -128,7 +163,10 @@ yourself: it can run their agents.
 ## 5. Tell them it's done
 
 Say what was set up (their Convex project and its URL, where the app is), and
-that the runner and app update themselves when their `main` changes.
+that the runner and app update themselves when their `main` changes. Also say,
+in a line, that full sync is off: it would let their phone, the website and other
+machines show tool output and diffs too, and Threadbear offers it once they pair a
+phone or add a machine (`tb settings full on` turns it on now).
 
 ## Another Mac (optional)
 
@@ -136,7 +174,16 @@ Running Threadbear on several machines is supported, for example a laptop and a
 Mac mini that's always on. Each runs its own threads in its own folders, and
 project files aren't copied between them. To add a Mac, follow this file on it
 and say yes to joining (`setup --existing`), then on the first Mac run
-`tb runner add <name> --ssh <that Mac>` and `tb restart` on the new one. (With no
+`tb runner add <name> --ssh <user>@<that Mac>.local` and `tb restart` on the new
+one; setup prints the exact command at the end. The new Mac needs Remote Login
+on (System Settings > General > Sharing > Remote Login; setup says if it's off),
+and the first Mac has to reach it by ssh without a password or a question, as
+`tb runner add` can't answer either: run `ssh -o ForwardAgent=no -o
+ClearAllForwardings=yes -o ForwardX11=no <user>@<that Mac>.local` once by hand and say yes to its host key only if the
+fingerprint matches the new Mac's own (`ssh-keygen -lf
+/etc/ssh/ssh_host_ed25519_key.pub` there), and run `ssh-copy-id -o
+ClearAllForwardings=yes <user>@<that Mac>.local` if it asks for a password.
+Setup prints both with the right names filled in. (With no
 ssh between them, `--out <file> --id <runnerId>` writes the key to a file, which
 goes in the new Mac's `secrets/convex-key`.) Only the first Mac's app lists every
 machine's threads, so that's best as the Mac they sit at; the phone and website
@@ -151,45 +198,51 @@ runner, like a second Mac: its threads show in the Mac app's sidebar and on
 the phone, and the composer's machine chip starts threads there. It runs the
 runner only, no app. Ubuntu 24.04 on x86_64 is what's been tried, on a
 Hetzner cloud server with 8 GB. Do this as an ordinary user with sudo, not root.
+Threads on it are opened and steered from the Mac through Convex, so nothing connects to it directly.
 
 1. **Packages:** `sudo apt-get install -y git build-essential imagemagick
-   librsvg2-bin bubblewrap jq lsof` (ImageMagick and rsvg-convert stand in for
+   librsvg2-bin bubblewrap jq lsof rsync` (ImageMagick and rsvg-convert stand in for
    macOS's sips and Quick Look when pictures are converted, rsvg-convert
    alone drawing SVGs; Codex's sandbox
    wants bubblewrap; lsof checks who's on the other end of a handover's
-   socket, and minimal images leave it out). zsh isn't needed: patch
+   socket, and minimal images leave it out; rsync is needed by the installation
+   checks). zsh isn't needed: patch
    commands run in the account's own shell, else bash. Set the account's full name, which agents are told:
    `sudo chfn -f "Their Name" $USER`. And a git identity, as on any machine
    that commits: `git config --global user.name` and `user.email`.
-2. **Node 24 with nvm**, at the path the scripts expect:
-   `nvm install 24.22.1` (else pass `--node` to the install script).
+2. **Node 24 or newer**, from nvm (`nvm install 24`), your package manager or
+   nodejs.org. The scripts take the `node` on PATH, else nvm's newest, so an
+   ssh session without nvm on its PATH still finds it; `--node` on the install
+   script, or `THREADBEAR_NODE`, picks one yourself.
 3. **The CLIs, logged in on this server:** Claude Code with its native
    installer (`curl -fsSL https://claude.ai/install.sh | bash`, which puts
    it in `~/.local/bin/claude`, where the runner looks), then
    `claude auth login`; Codex with `npm i -g @openai/codex`, then
    `codex login --device-auth`. Both print a link for them to open in their
    own browser. Never copy credentials over from the Mac.
-4. **Tailscale:** install it and `sudo tailscale up --hostname=<name>`, and
+4. **Tailscale (optional):** install it and `sudo tailscale up --hostname=<name>`, and
    **Ask** them to open the link it prints. Once it's on their tailnet, close
    the server's public SSH port in the cloud's firewall and use the tailnet
    name instead.
 5. **The code:** clone their fork to `~/dev/me/threadbear` (any folder
    works) and, in `runner/`, `npm ci`.
-6. **Join their backend:** copy `secrets/convex-key` from the Mac's data
-   folder to the same place here (`~/Library/Application Support/Threadbear`;
-   the folders keep their macOS names on Linux, so every path in these docs
-   is the same) with `scp`, never by printing it, and `chmod 600` it. Then
-   write `runner.json` there: `port` 8797, and `sync` with `url` (the Mac's
-   `sync.url`), `name` (what the sidebar calls this machine) and `rpcUrl`
-   (`wss://<tailnet name>:8798/rpc`).
+6. **Join their backend:** make `~/Library/Application Support/Threadbear`
+   here (the folders keep their macOS names on Linux, so every path in these
+   docs is the same). Write `runner.json` there: `port` 8797, `defaults` with
+   `cwd` (the work folder, which must exist) and `permissionMode` `"auto"`, as
+   setup gives a new Mac (threads that name no mode start on Auto), and
+   `sync.name` (what the sidebar calls this machine). Then, on the first Mac,
+   run `tb runner add <name> --ssh <user@server>`. It writes the backend URL,
+   a runner id and a separate runner key to this server. Add `sync.full`
+   `true` to send this server's tool output to Convex too, so the Mac, the phone
+   and the website can show it even when this server's off; a runner key's machine
+   is never asked about it. Never copy the Mac's
+   main key or deploy key.
 7. **Install:** `runner/scripts/install-runner.sh`. On Linux it writes a
    systemd user service, `~/.config/systemd/user/com.mikerosoft.threadbear.runner.service`,
    in place of the LaunchAgent. Turn on lingering once, or it stops when
    nobody is logged in: `sudo loginctl enable-linger $USER`.
-8. **Reach it from the Mac:** `sudo tailscale serve --bg --https=8798
-   http://127.0.0.1:8797` here, then `tb pair` here prints the two files to
-   copy to the Mac.
-9. **Updates:** the runner follows its checkout's `main` like the Mac's
+8. **Updates:** the runner follows its checkout's `main` like the Mac's
    does, so keep that checkout pulling theirs: a systemd user timer that runs
    `git -C <checkout> pull --ff-only` every few minutes.
 

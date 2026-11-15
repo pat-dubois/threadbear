@@ -6,8 +6,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Account, Pool, UsageWindow } from '../../src/protocol.ts';
-// Mike's pool folders, as his runner.json has them (poolFolders).
-const DEFAULT_POOL_FOLDERS: Record<string, string[]> = { 'claude-2': ['~/dev/convex'] };
+// Alex's pool folders, as his runner.json has them (poolFolders).
+const DEFAULT_POOL_FOLDERS: Record<string, string[]> = { 'claude-2': ['~/dev/work'] };
 import {
   UNKNOWN_WAIT_MS,
   WAIT_SLACK_MS,
@@ -40,15 +40,15 @@ function acct(id: string, opts: { provider?: 'claude' | 'codex'; note?: string; 
   return a;
 }
 
-const MIKE = [acct('claude-main'), acct('claude-1'), acct('claude-2', { note: 'Convex work only' }), acct('claude-3'), acct('codex-main')];
+const ALEX = [acct('claude-main'), acct('claude-1'), acct('claude-2', { note: 'Work only' }), acct('claude-3'), acct('codex-main')];
 
 // ---------------------------------------------------------- the list
 
-test("defaultPools: one per provider without notes, one per noted login, in Mike's order", () => {
-  const pools = defaultPools(MIKE, {}, DEFAULT_POOL_FOLDERS);
+test("defaultPools: one per provider without notes, one per noted login, in Alex's order", () => {
+  const pools = defaultPools(ALEX, {}, DEFAULT_POOL_FOLDERS);
   assert.deepEqual(pools, [
     { id: 'claude', title: 'Claude', accountIds: ['claude-main', 'claude-1', 'claude-3'], builtIn: true },
-    { id: 'convex', title: 'Convex', accountIds: ['claude-2'], builtIn: true, folders: ['~/dev/convex'] },
+    { id: 'work', title: 'Work', accountIds: ['claude-2'], builtIn: true, folders: ['~/dev/work'] },
     { id: 'codex', title: 'Codex', accountIds: ['codex-main'], builtIn: true },
   ]);
 });
@@ -67,21 +67,21 @@ test('defaultPools: notes from the map count too; a note with no word, or a clas
 
 test("readPools: runner.json's list replaces the built-in one; bad entries are skipped", () => {
   const saved = [{ id: 'mine', title: 'Mine', accountIds: ['claude-3', 'codex-main'], folders: [' ~/x ', ''] }, { id: 'broken' }, 'nope'];
-  assert.deepEqual(readPools({ pools: saved }, MIKE), [{ id: 'mine', title: 'Mine', accountIds: ['claude-3', 'codex-main'], folders: ['~/x'] }]);
+  assert.deepEqual(readPools({ pools: saved }, ALEX), [{ id: 'mine', title: 'Mine', accountIds: ['claude-3', 'codex-main'], folders: ['~/x'] }]);
   // An icon is kept, trimmed; a blank or non-string one is dropped.
   const icons = [{ id: 'a', title: 'A', accountIds: ['claude-3'], icon: ' leaf ' }, { id: 'b', title: 'B', accountIds: ['claude-3'], icon: 7 }, { id: 'c', title: 'C', accountIds: ['claude-3'], icon: ' ' }];
-  assert.deepEqual(readPools({ pools: icons }, MIKE).map((p) => p.icon), ['leaf', undefined, undefined]);
+  assert.deepEqual(readPools({ pools: icons }, ALEX).map((p) => p.icon), ['leaf', undefined, undefined]);
   // Nothing usable, or nothing saved: the built-in ones.
-  assert.equal(readPools({ pools: ['nope'] }, MIKE, DEFAULT_POOL_FOLDERS)[0].builtIn, true);
-  assert.equal(readPools({}, MIKE).length, 3);
+  assert.equal(readPools({ pools: ['nope'] }, ALEX, DEFAULT_POOL_FOLDERS)[0].builtIn, true);
+  assert.equal(readPools({}, ALEX).length, 3);
   assert.equal(readPools({ accountNotes: { 'claude-1': 'Work' } }, [acct('claude-1')])[0].id, 'work');
 });
 
 test('validatePools: duplicates, blanks, empty logins and unknown logins are refused', () => {
-  const ok = validatePools([{ id: 'a', title: 'A', accountIds: ['claude-1'], builtIn: true }], MIKE);
+  const ok = validatePools([{ id: 'a', title: 'A', accountIds: ['claude-1'], builtIn: true }], ALEX);
   assert.deepEqual(ok, { pools: [{ id: 'a', title: 'A', accountIds: ['claude-1'] }] }, 'builtIn is dropped');
-  assert.deepEqual(validatePools([], MIKE), { pools: [] });
-  const err = (raw: unknown) => ('error' in validatePools(raw, MIKE) ? (validatePools(raw, MIKE) as { error: string }).error : '');
+  assert.deepEqual(validatePools([], ALEX), { pools: [] });
+  const err = (raw: unknown) => ('error' in validatePools(raw, ALEX) ? (validatePools(raw, ALEX) as { error: string }).error : '');
   assert.match(err({}), /must be an array/);
   assert.match(err([{ id: 'a', title: 'A', accountIds: ['claude-1'] }, { id: 'a', title: 'B', accountIds: ['claude-3'] }]), /Two pools are called a/);
   assert.match(err([{ id: ' ', title: 'A', accountIds: ['claude-1'] }]), /blank id/);
@@ -92,8 +92,8 @@ test('validatePools: duplicates, blanks, empty logins and unknown logins are ref
 });
 
 test('findPool: by id, else id or title ignoring case', () => {
-  const pools = defaultPools(MIKE, {}, {});
-  assert.equal(findPool(pools, 'convex')?.id, 'convex');
+  const pools = defaultPools(ALEX, {}, {});
+  assert.equal(findPool(pools, 'work')?.id, 'work');
   assert.equal(findPool(pools, 'Claude')?.id, 'claude');
   assert.equal(findPool(pools, 'CODEX ')?.id, 'codex');
   assert.equal(findPool(pools, 'grok'), undefined);
@@ -119,11 +119,12 @@ for (const c of folderCases.cases) {
 const CLAUDE: Pool = { id: 'claude', title: 'Claude', accountIds: ['claude-main', 'claude-1', 'claude-3'] };
 const MIXED: Pool = { id: 'all', title: 'All', accountIds: ['claude-main', 'codex-main', 'claude-1'] };
 
-test('loginOk: blocked or under 10% is not; unknown usage is', () => {
+test('loginOk: blocked or under 1% is not; unknown usage is', () => {
   assert.equal(loginOk(acct('a')), true);
-  assert.equal(loginOk(acct('a', { five: 10, week: 50 })), true);
-  assert.equal(loginOk(acct('a', { five: 9.5, week: 50 })), false);
-  assert.equal(loginOk(acct('a', { five: 80, week: 5 })), false);
+  assert.equal(loginOk(acct('a', { five: 1, week: 50 })), true);
+  assert.equal(loginOk(acct('a', { five: 3, week: 50 })), true, 'a login is used until it is all but out, not left at 10%');
+  assert.equal(loginOk(acct('a', { five: 0.9, week: 50 })), false);
+  assert.equal(loginOk(acct('a', { five: 80, week: 0.5 })), false);
   assert.equal(loginOk(acct('a', { five: 80, blocked: true })), false);
 });
 
@@ -134,11 +135,11 @@ test('pickInPool: current stays while OK; else most room; unknown after known; p
   assert.equal(pickInPool(CLAUDE, list, { provider: 'claude', prefer: 'claude-3' }), 'claude-3');
   assert.equal(pickInPool(CLAUDE, list, { provider: 'claude', exclude: ['claude-1', 'claude-3'] }), 'claude-main');
   assert.equal(pickInPool(CLAUDE, list, { provider: 'codex' }), undefined, 'codex-main is not in the pool');
-  const lowCurrent = [acct('claude-main', { five: 5 }), acct('claude-1'), acct('claude-3', { five: 30 })];
+  const lowCurrent = [acct('claude-main', { five: 0.5 }), acct('claude-1'), acct('claude-3', { five: 30 })];
   assert.equal(pickInPool(CLAUDE, lowCurrent, { provider: 'claude', current: 'claude-main' }), 'claude-3', 'known room beats unknown');
   assert.equal(pickInPool(CLAUDE, lowCurrent, { provider: 'claude', exclude: ['claude-3'] }), 'claude-1', 'then unknown');
   assert.equal(pickInPool(CLAUDE, lowCurrent, { provider: 'claude', prefer: 'claude-1' }), 'claude-1', 'a preferred login with unknown usage stays, as pickAccount');
-  const dry = [acct('claude-main', { five: 5 }), acct('claude-1', { blocked: true }), acct('claude-3', { five: 2 })];
+  const dry = [acct('claude-main', { five: 0.5 }), acct('claude-1', { blocked: true }), acct('claude-3', { five: 0.2 })];
   assert.equal(pickInPool(CLAUDE, dry, { provider: 'claude' }), undefined);
 });
 
@@ -151,10 +152,10 @@ test('pickInPool: the login whose week resets soonest goes first, while it has r
   assert.equal(pickInPool(CLAUDE, list, { provider: 'claude', now: NOW + 6 * 60 * 60_000 }), 'claude-1', 'once claude-3 has reset, its next reset is unknown');
   assert.equal(pickInPool(CLAUDE, list, { provider: 'claude', current: 'claude-main', now: NOW }), 'claude-main', 'a thread on a login with room stays put');
   // Down to the floor: it's left, and the next to reset is used.
-  const low = [list[0], list[1], acct('claude-3', { five: 99, week: 9, weekResets: 5 * 60 })];
+  const low = [list[0], list[1], acct('claude-3', { five: 99, week: 0.9, weekResets: 5 * 60 })];
   assert.equal(pickInPool(CLAUDE, low, { provider: 'claude', now: NOW }), 'claude-1');
   // The tighter 5-hour window counts too.
-  const busy = [list[0], list[1], acct('claude-3', { five: 4, week: 37, weekResets: 5 * 60 })];
+  const busy = [list[0], list[1], acct('claude-3', { five: 0.4, week: 37, weekResets: 5 * 60 })];
   assert.equal(pickInPool(CLAUDE, busy, { provider: 'claude', now: NOW }), 'claude-1');
   // The same reset: most room, then prefer.
   const same = [acct('claude-main', { week: 40, weekResets: 60 }), acct('claude-1', { week: 60, weekResets: 60 }), acct('claude-3', { week: 60, weekResets: 60 })];
@@ -169,15 +170,15 @@ test('nextLogin: same provider first, then spill in pool order, then a wait', ()
   const thread = { accountId: 'claude-main', provider: 'claude' as const };
   let list = [acct('claude-main', { five: 0, blocked: true, resets: 120 }), acct('codex-main', { five: 80 }), acct('claude-1', { five: 50 })];
   assert.deepEqual(nextLogin(MIXED, list, thread, NOW), { accountId: 'claude-1', provider: 'claude' });
-  list = [acct('claude-main', { five: 0, blocked: true, resets: 120 }), acct('codex-main', { five: 80 }), acct('claude-1', { five: 3, resets: 60 })];
+  list = [acct('claude-main', { five: 0, blocked: true, resets: 120 }), acct('codex-main', { five: 80 }), acct('claude-1', { five: 0.3, resets: 60 })];
   assert.deepEqual(nextLogin(MIXED, list, thread, NOW), { accountId: 'codex-main', provider: 'codex' });
-  list = [acct('claude-main', { five: 0, blocked: true, resets: 120 }), acct('codex-main', { blocked: true }), acct('claude-1', { five: 3, resets: 60 })];
+  list = [acct('claude-main', { five: 0, blocked: true, resets: 120 }), acct('codex-main', { blocked: true }), acct('claude-1', { five: 0.3, resets: 60 })];
   assert.deepEqual(nextLogin(MIXED, list, thread, NOW), { waitUntil: new Date(NOW + 60 * 60_000 + WAIT_SLACK_MS).toISOString(), accountId: 'claude-1' });
   assert.deepEqual(poolProviders(MIXED, list), ['claude', 'codex']);
 });
 
 test('roomWait: the earliest login back plus a minute, or 30 minutes when none says', () => {
-  const list = [acct('claude-main', { five: 0, blocked: true, resets: 300 }), acct('claude-1', { five: 50, week: 4, resets: 90 }), acct('claude-3', { five: 2, resets: 45 })];
+  const list = [acct('claude-main', { five: 0, blocked: true, resets: 300 }), acct('claude-1', { five: 50, week: 0.4, resets: 90 }), acct('claude-3', { five: 0.2, resets: 45 })];
   assert.deepEqual(roomWait(CLAUDE, list, NOW), { waitUntil: at(46), accountId: 'claude-3' });
   assert.deepEqual(roomWait(CLAUDE, [acct('claude-main', { blocked: true })], NOW), { waitUntil: new Date(NOW + UNKNOWN_WAIT_MS).toISOString() });
 });

@@ -4,6 +4,11 @@ import type { QueryCtx, MutationCtx } from './_generated/server';
 import type { Id } from './_generated/dataModel';
 import { callerFrom, FORBIDDEN, forbiddenMessage, isOwnerKey, mayCall, validRunnerId, type Caller } from './runnerAccess';
 
+// A runner's word that Mike is at its Mac counts while it's still checking
+// in; a Mac that's asleep or offline counts as away (devices.ts
+// threadForPush, sync.ts sendStaleHeldPushes).
+export const PRESENCE_FRESH_MS = 3 * 60_000;
+
 // The runner's functions carry the key from its secrets/convex-key: the
 // owner key (the deployment's RUNNER_KEY, set with `npx convex env set
 // RUNNER_KEY <key>`) or a runner key (runnerKeys, `tb runner add`). Every
@@ -81,6 +86,17 @@ export function pageLimit(limit: number | undefined, fallback: number, max: numb
   return Math.max(1, Math.min(max, Math.floor(limit)));
 }
 
+// A message's or tool body's seq: a whole number from 0 to MAX_SEQ.
+// v.number() takes NaN, the infinities, fractions and numbers past 2^53,
+// and a runner key's bad seq would break the order of its thread and the
+// event ids the main Mac's runner makes from it (seq times 8, plus a few,
+// runner/src/relay.ts SCALE), so it's refused where it comes in (Daybreak,
+// 15 Nov 2026). Seqs count a thread's events, so this is far past any.
+export const MAX_SEQ = 2 ** 49;
+export function isSeq(n: unknown): n is number {
+  return Number.isSafeInteger(n) && (n as number) >= 0 && (n as number) <= MAX_SEQ;
+}
+
 export async function sha256(text: string): Promise<string> {
   const data = new TextEncoder().encode(text);
   const digest = await crypto.subtle.digest('SHA-256', data);
@@ -124,4 +140,18 @@ export async function saveRunnerOrder(ctx: MutationCtx, runnerIds: string[]): Pr
   const row = await ctx.db.query('runnerOrder').first();
   if (row) await ctx.db.patch(row._id, { runnerIds: ids });
   else await ctx.db.insert('runnerOrder', { runnerIds: ids });
+}
+
+// A repo's address with nothing in it that could be a password or token
+// (runner/src/move-git.ts withoutCredentials, the same rule): what a move
+// stores about a thread's repo is for knowing which repo it is, and the
+// runner it goes to can read it. An older runner may still send one whole.
+export function withoutCredentials(url: string): string {
+  const m = /^([a-z][a-z0-9+.-]*:\/\/)([^/?#]*@)?([^?#]*)(?:[?#].*)?$/i.exec(url.trim());
+  if (!m) return url.trim();
+  const [, scheme, userinfo, rest] = m;
+  if (!userinfo) return `${scheme}${rest}`;
+  if (/^(https?|ftps?):\/\//i.test(scheme!)) return `${scheme}${rest}`;
+  const user = userinfo.slice(0, -1).split(':')[0];
+  return `${scheme}${user ? `${user}@` : ''}${rest}`;
 }

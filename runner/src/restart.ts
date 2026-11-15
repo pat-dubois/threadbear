@@ -70,6 +70,7 @@ export type Notice = { level: 'info' | 'warning' | 'error'; message: string };
 
 // runner.status's result (docs/protocol.md).
 export type RunnerStatus = {
+  webRuntimeProblem?: string;
   version: string;
   release?: string;
   pid: number;
@@ -80,6 +81,11 @@ export type RunnerStatus = {
   liveClis: number;
   running: string[]; // starting, running or waiting on an approval or a question
   background?: Background[]; // background shells and subagents still going
+  // Every thread a reinstall waits for: running, background work, a
+  // turn-end hook, between turns, or running an action (busyThreads below).
+  // For deploy.mjs's --check-idle, which install-runner.sh asks again right
+  // before it stops the runner; running and background alone missed hooks.
+  busy?: string[];
   pendingRestart?: { when: RestartWhen; reason?: string; release?: string; resumeThreadId?: string; requestedAt: string; backgroundUntil?: string; waitingFor: string[] };
   // This release is running because launch.mjs went back to it from `from`,
   // which kept crashing at startup. A deploy's health check can pass before
@@ -91,6 +97,9 @@ export type RunnerStatus = {
   update?: UpdateStatus;
   // Mike's releases, for a fork (upstream.ts; main.ts adds it).
   upstream?: UpstreamStatus;
+  // Other runners that aren't following GitHub's main properly, from their
+  // heartbeats (the main Mac's runner only; main.ts adds it).
+  behindRunners?: { name: string; problem: string }[];
   // The Convex mirror (src/sync.ts; main.ts adds it).
   sync?: SyncStatus;
   secretCheck?: SecretCheckStatus;
@@ -129,15 +138,26 @@ export const BIN_DIR = path.resolve(import.meta.dirname, '..', 'bin');
 // tb reads, and agents point it at a dev runner; THREADBEAR_RUNNER_HOME
 // always names the runner the thread is on, so the scripts' guards against
 // restarting it from inside one of its threads go by that.
-export function threadEnv(threadId: string, home: string, basePath = process.env.PATH): Record<string, string> {
+// `key` is the thread's own RPC credential (docs/protocol.md, "A thread's own
+// key"), only for a thread's CLI: a patch's action and a worktree's setup run
+// on the runner's say-so, so tb there still reads the token. The empty value
+// matters: a dev runner started from a thread would otherwise pass its parent
+// thread's key on to everything it starts.
+export function threadEnv(threadId: string, home: string, basePath = process.env.PATH, key?: string): Record<string, string> {
   return {
     THREADBEAR_THREAD_ID: threadId,
+    THREADBEAR_THREAD_KEY: key ?? '',
     THREADBEAR_HOME: home,
     THREADBEAR_RUNNER_HOME: home,
     THREADBEAR_RUNNER_VERSION: RUNNER_VERSION,
     // A picture copied in here can be on the thread's shared page; one
     // anywhere else can't (docs/protocol.md, "Sharing").
     THREADBEAR_MEDIA_DIR: paths.media(home, threadId),
+    // The Node this runner runs on, which the repo's scripts take before
+    // looking on PATH (scripts/find-node.sh): a thread's checks, landing and
+    // deploys then use the runner's own Node on any Mac, not one at a path
+    // only Mike's has (a fork's commit, 8 Nov).
+    THREADBEAR_NODE: process.execPath,
     // The old names too, for skills and scripts written before the rename.
     THREADBARE_THREAD_ID: threadId,
     THREADBARE_HOME: home,
@@ -147,7 +167,7 @@ export function threadEnv(threadId: string, home: string, basePath = process.env
 }
 
 export type RestarterDeps = {
-  runner: Pick<Runner, 'list' | 'get' | 'send' | 'note' | 'notice' | 'onNotification' | 'events' | 'backgroundWork' | 'threadsWithHooksRunning' | 'refuseNewTurns'>;
+  runner: Pick<Runner, 'list' | 'get' | 'send' | 'note' | 'notice' | 'onNotification' | 'events' | 'backgroundWork' | 'threadsWithHooksRunning' | 'threadsBetweenTurns' | 'refuseNewTurns'> & Partial<Pick<Runner, 'threadsRunningActions'>>;
   home: string;
   clock: Clock;
   log: Logger;
@@ -306,6 +326,7 @@ export class Restarter {
       liveClis: all.filter((t) => t.live).length,
       running,
       background: this.deps.runner.backgroundWork(),
+      busy: this.busyThreads(),
     };
     if (this.deps.release) out.release = this.deps.release;
     if (this.deps.branch) out.branch = this.deps.branch;
@@ -363,6 +384,13 @@ export class Restarter {
   // too, and an agent waiting on a 40-minute test run would never hear back.
   // Background work only holds it until backgroundUntil, though: a dev
   // server or a watcher never finishes.
+  // For the LaunchAgent reinstall (reinstall.ts), which stops every runner
+  // at once, handovers and all: what a restart waits for, and Run commands
+  // and patch actions too.
+  busyThreads(): string[] {
+    return [...new Set([...this.busy(), ...(this.deps.runner.threadsRunningActions?.() ?? [])])];
+  }
+
   private busy(): string[] {
     const ids = new Set(
       this.deps.runner
@@ -376,6 +404,8 @@ export class Restarter {
     // for it would wait for the next runner. Hooks end by themselves (runCommand's
     // timeout), so no limit like background work's.
     for (const id of this.deps.runner.threadsWithHooksRunning()) ids.add(id);
+    // An edit cutting the session back, or a worktree being set up.
+    for (const id of this.deps.runner.threadsBetweenTurns()) ids.add(id);
     return [...ids];
   }
 

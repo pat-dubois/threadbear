@@ -98,6 +98,9 @@ export const buttonsPart = {
     const button = st.rec.buttons?.find((b) => b.id === buttonId);
     if (!button) throw new RpcError(ErrorCode.badParams, `Button not found: ${buttonId}`);
     if (button.pressed) return { button: structuredClone(button) };
+    // A Run from the card's command, which was taken out (14 Nov 2026):
+    // one saved before then has neither, so it does nothing now.
+    if (!button.start && !button.send) throw new RpcError(ErrorCode.badParams, 'This button no longer does anything.');
     // Access is checked again now, not only when it was made: the maker or
     // the target may have changed mode since (Codex's review, 7 Nov 2026).
     // A refusal here is saved as a failed press, like any other.
@@ -128,6 +131,10 @@ export const buttonsPart = {
           ...(s.model ? { model: s.model } : {}),
           ...(s.effort ? { effort: s.effort } : {}),
           permissionMode: s.permissionMode,
+          // Mike's press, of a button he allowed when a sandboxed thread
+          // made it (add_button's card says "outside the sandbox"). One
+          // into a sandbox folder is still shut in there.
+          unconfine: true,
           startedBy: { kind: 'thread', label: 'Button', threadId: st.rec.id, threadTitle: st.rec.title, ...(s.why ? { why: s.why } : {}) },
         });
         next = { ...button, pressed: { at: this.isoNow(), threadId: r.thread.id } };
@@ -142,6 +149,8 @@ export const buttonsPart = {
       this.persistButton(st, { ...button, failed: { at: this.isoNow(), error: error.slice(0, 300) } });
       throw e instanceof RpcError ? e : new RpcError(ErrorCode.badParams, error);
     }
+    // For the agent, before Mike's next message (Runner.takePressNews).
+    this.notePress(st.rec, next);
     this.persistButton(st, next);
     return { button: structuredClone(next) };
   },

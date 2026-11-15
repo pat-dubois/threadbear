@@ -90,9 +90,13 @@ type LoadedPatch = { info: PatchInfo; panels: Panel[]; actions: Action[]; hooks:
 // built in, so a fresh worktree builds from cold. With `keep`, an archived
 // thread's worktree is set aside, those folders and all, for the next
 // thread rather than removed (worktrees.ts, "spares").
-// `setupRun` is `setup` as it runs, for a patch trusted by its hash
-// (bindAutomatic); absent, `setup` runs as written.
-export type WorktreeConfig = { setup?: string; check?: string; keep?: string[]; setupRun?: string };
+// `teardown` runs in the worktree's root when its thread is archived or
+// deleted, before the cleanup, landed or not: for what setup made outside
+// the folder (a Convex deployment per worktree, elie-h's fork, 6 Nov), as a
+// branch landed by a squashed PR never counts as merged here.
+// `setupRun` and `teardownRun` are `setup` and `teardown` as they run, for
+// a patch trusted by its hash (bindAutomatic); absent, they run as written.
+export type WorktreeConfig = { setup?: string; check?: string; teardown?: string; keep?: string[]; setupRun?: string; teardownRun?: string };
 
 // A folder of one of the thread's projects.
 export type ProjectFolder = { folder: string; projectId: string };
@@ -418,7 +422,7 @@ async function loadPatchFile(file: string, source: 'home' | 'project', cache: Pa
 }
 
 // The patch version each bound automatic command (a hook's `exec`, a
-// setup's `setupRun`) was approved by, so the runner can check the patch
+// setup's `setupRun`, a teardown's `teardownRun`) was approved by, so the runner can check the patch
 // still hashes to it just before running it: a script runs from the
 // folder, not from the bytes that were hashed.
 const boundBy = new Map<string, { file: string; hash: string }>();
@@ -471,9 +475,10 @@ export function actionRunProblem(action: Action, info: PatchInfo | undefined, ve
 }
 
 // A trusted-by-hash patch's commands that run by themselves (its hooks and
-// worktree setup) as they'll run: each must be one hashed script and plain
-// words (automaticCommand), or the whole patch is refused with why, as a
-// patch whose code can't all be checked is. A copy, as `loaded` is cached.
+// worktree setup and teardown) as they'll run: each must be one hashed
+// script and plain words (automaticCommand), or the whole patch is refused
+// with why, as a patch whose code can't all be checked is. A copy, as
+// `loaded` is cached.
 // Actions aren't held to it, as one runs only when it's pressed, but what
 // each runs must be followable and hashed (actionCommandProblem), checked
 // again when it's pressed (actionRunProblem).
@@ -512,6 +517,12 @@ function bindAutomatic(loaded: LoadedPatch, file: string, files: string[], block
     const bound = automaticCommand(worktree.setup, folder, files, blocked);
     if ('problem' in bound) return refuse('worktree setup', bound.problem);
     worktree = { ...worktree, setupRun: note(bound.run) };
+  }
+  // Held to the same: it runs by itself too, as the thread is archived.
+  if (worktree?.teardown) {
+    const bound = automaticCommand(worktree.teardown, folder, files, blocked);
+    if ('problem' in bound) return refuse('worktree teardown', bound.problem);
+    worktree = { ...worktree, teardownRun: note(bound.run) };
   }
   return { ...loaded, actions, hooks, ...(worktree ? { worktree } : {}) };
 }
@@ -557,10 +568,10 @@ export function readPatchModule(id: string, source: 'home' | 'project', file: st
   };
   let worktree: WorktreeConfig | undefined;
   if (v.worktree !== undefined) {
-    const w = v.worktree as { setup?: unknown; check?: unknown; keep?: unknown };
+    const w = v.worktree as { setup?: unknown; check?: unknown; teardown?: unknown; keep?: unknown };
     if (!w || typeof w !== 'object' || Array.isArray(w)) return problem('worktree should be an object with setup and/or check.');
     worktree = {};
-    for (const key of ['setup', 'check'] as const) {
+    for (const key of ['setup', 'check', 'teardown'] as const) {
       if (w[key] === undefined) continue;
       if (typeof w[key] !== 'string' || !w[key].trim()) return problem(`worktree.${key} should be a command.`);
       worktree[key] = w[key];
@@ -658,6 +669,15 @@ export function readPatchModule(id: string, source: 'home' | 'project', file: st
   if (worktree) loaded.worktree = worktree;
   if (appliesTo) loaded.appliesTo = appliesTo;
   return loaded;
+}
+
+// A url panel's `{threadId}` filled in with the thread it's beside, so a
+// patch's page can tell which thread it's in (its "Ask in this thread",
+// say). Done as the summary is made, as the set is shared by every
+// thread in the folder.
+export function withThreadId(panels: Panel[], threadId: string): Panel[] {
+  if (!panels.some((p) => p.url?.includes('{threadId}'))) return panels;
+  return panels.map((p) => (p.url?.includes('{threadId}') ? { ...p, url: p.url.replaceAll('{threadId}', encodeURIComponent(threadId)) } : p));
 }
 
 // An action's url, normalised, if it's an http or https page; null if not.
@@ -759,9 +779,14 @@ export function slug(title: string): string {
     .replace(/^-+|-+$/g, '') || 'untitled';
 }
 
+// At most ERROR_LINE_CHARS: it goes to clients as a panel's note or a
+// patch's liveError, and a function can throw anything (a command's 12 MB
+// last line, Codex's review of the 16 MB sh cap, 13 Nov).
+const ERROR_LINE_CHARS = 500;
 function firstLine(e: unknown): string {
   const text = String((e as Error)?.message ?? e);
-  return text.split('\n').find((l) => l.trim()) ?? 'Unknown error';
+  const line = text.split('\n').find((l) => l.trim()) ?? 'Unknown error';
+  return line.length > ERROR_LINE_CHARS ? `${line.slice(0, ERROR_LINE_CHARS)}…` : line;
 }
 
 // The built-in set alone, synchronous: what the first summary of a thread
@@ -940,6 +965,7 @@ export type PanelRender = { image?: ImageRef; items?: PanelItem[]; note?: string
 export type LiveContext = {
   cwd: string;
   threadId: string;
+  thread?: PatchThread;
   run: (command: string, cwd: string) => Promise<CommandOutcome>;
   verify?: (file: string, hash: string) => boolean;
   timeoutMs?: number;
@@ -949,6 +975,22 @@ export type LiveContext = {
 // patch's checks are its own, so its refusals don't reach another's.
 // `close`: the function's call is over (it returned, threw or timed
 // out); a command it starts after that isn't run.
+// How much of a command's output a patch function's sh gets
+// (runPatchCommand). Was the 64 KB a message keeps, cut silently, so
+// `tandem waiting --json` on a folder of 32 projects (310 KB) reached the
+// Tandem patch as half a JSON document and its JSON.parse threw (13 Nov).
+export const PATCH_SH_MAX_BYTES = 16 * 1024 * 1024;
+
+// What sh resolves to: the command's whole output, or an error. Never
+// part of it: a function parsing it would fail somewhere far from the
+// cause, as Tandem's did.
+function shText(command: string, out: CommandOutcome): string {
+  // Only the start of its last line: the output can be megabytes now.
+  if (!out.ok) throw new Error(`${command} failed${out.exitCode !== undefined ? ` (exit ${out.exitCode})` : ''}: ${(out.text.trim().split('\n').pop() ?? '').slice(0, 1000)}`);
+  if (out.truncated) throw new Error(`${command} printed more than the ${Math.round(PATCH_SH_MAX_BYTES / 1024 / 1024)} MB a patch's sh reads`);
+  return out.text;
+}
+
 type LiveSh = { dir: string; key: string; run: (command: string) => Promise<CommandOutcome>; close: () => void };
 
 // How a patch's live function runs a command. A trusted-by-hash patch's
@@ -1007,7 +1049,12 @@ function callThenClose(call: () => unknown, shIn: LiveSh): unknown {
 // and only what trusting it covers (liveSh).
 // `matched` is what made a tool patch apply: the paths its appliesTo
 // found (two .tandem files in a folder are two), and empty otherwise.
-export type ItemsContext = { cwd: string; threadId: string; matched: string[]; sh: (command: string) => Promise<string> };
+// `thread` is the thread it's for: its title and its projects (a part
+// carries its parent), so a patch in a folder many threads share can show
+// in only some of them (`when: ({ thread }) => thread.projects.some(...)`).
+export type PatchThread = { title: string; projects: { id: string; title: string; parent?: { id: string; title: string } }[] };
+export type ItemsContext = { cwd: string; threadId: string; thread: PatchThread; matched: string[]; sh: (command: string) => Promise<string> };
+const NO_THREAD: PatchThread = { title: '', projects: [] };
 type ItemsFunction = (ctx: ItemsContext) => unknown;
 
 // The `items` functions of loaded patch files, by file and the panel's id
@@ -1034,15 +1081,11 @@ export async function renderListPanel(
   // A project folder's patch runs in that folder, as its actions do.
   const cwd = info?.folder ?? ctx.cwd;
   const shIn = liveSh(info?.file, cwd, ctx);
-  const sh = async (command: string) => {
-    const out = await shIn.run(command);
-    if (!out.ok) throw new Error(`${command} failed${out.exitCode !== undefined ? ` (exit ${out.exitCode})` : ''}: ${out.text.trim().split('\n').pop() ?? ''}`);
-    return out.text;
-  };
+  const sh = async (command: string) => shText(command, await shIn.run(command));
   let timer: NodeJS.Timeout | undefined;
   try {
     const value = await Promise.race([
-      Promise.resolve().then(() => callThenClose(() => fn({ cwd, threadId: ctx.threadId, matched: info?.matched ?? [], sh }), shIn)),
+      Promise.resolve().then(() => callThenClose(() => fn({ cwd, threadId: ctx.threadId, thread: ctx.thread ?? NO_THREAD, matched: info?.matched ?? [], sh }), shIn)),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error(`took over ${Math.round((ctx.timeoutMs ?? LIST_TIMEOUT_MS) / 1000)} seconds`)), ctx.timeoutMs ?? LIST_TIMEOUT_MS);
       }),
@@ -1098,10 +1141,7 @@ export async function applyLive(set: PatchSet, ctx: LiveContext): Promise<PatchS
       const key = `${shIn.key}\u0000${command}`;
       let out = ran.get(key);
       if (!out) {
-        out = shIn.run(command).then((o) => {
-          if (!o.ok) throw new Error(`${command} failed${o.exitCode !== undefined ? ` (exit ${o.exitCode})` : ''}: ${o.text.trim().split('\n').pop() ?? ''}`);
-          return o.text;
-        });
+        out = shIn.run(command).then((o) => shText(command, o));
         ran.set(key, out);
       }
       return out;
@@ -1109,7 +1149,7 @@ export async function applyLive(set: PatchSet, ctx: LiveContext): Promise<PatchS
     let timer: NodeJS.Timeout | undefined;
     try {
       return await Promise.race([
-        Promise.resolve().then(() => callThenClose(() => fn({ cwd, threadId: ctx.threadId, matched: info?.matched ?? [], sh }), shIn)),
+        Promise.resolve().then(() => callThenClose(() => fn({ cwd, threadId: ctx.threadId, thread: ctx.thread ?? NO_THREAD, matched: info?.matched ?? [], sh }), shIn)),
         new Promise((_, reject) => {
           timer = setTimeout(() => reject(new Error(`took over ${Math.round(timeoutMs / 1000)} seconds`)), timeoutMs);
         }),
@@ -1252,9 +1292,13 @@ export function runCommand(
   // can't outlive it (shell-allowlist.ts). A program that leaves the group
   // (setsid, setpgid, a daemon that forks away) isn't reached; none on the
   // live list does.
-  opts: { cwd: string; env: Record<string, string | undefined>; shell?: string[]; timeoutMs?: number; background?: boolean; killGroup?: boolean; killGraceMs?: number },
+  // `maxBytes`: how much of what it printed is kept, 64 KB unless said
+  // (what fits in a message). A patch function's sh asks for far more
+  // (PATCH_SH_MAX_BYTES): it parses the output itself, never sends it on.
+  opts: { cwd: string; env: Record<string, string | undefined>; shell?: string[]; timeoutMs?: number; background?: boolean; killGroup?: boolean; killGraceMs?: number; maxBytes?: number },
 ): Promise<CommandOutcome> {
   const started = Date.now();
+  const maxBytes = opts.maxBytes ?? LIMITS.toolResultText;
   const [shellBin, ...shellArgs] = opts.shell ?? loginShell();
   const [bin, args] = opts.background ? inBackground(shellBin, [...shellArgs, command]) : [shellBin, [...shellArgs, command]];
   return new Promise((resolve) => {
@@ -1264,7 +1308,7 @@ export function runCommand(
     // A little past the limit is read, so the cut back to it can be placed
     // where no secret is split (safe-cut.ts): what's kept goes to Convex in a
     // hook's message.
-    const limit = LIMITS.toolResultText + CUT_LOOKAHEAD;
+    const limit = maxBytes + CUT_LOOKAHEAD;
     const take = (chunk: Buffer) => {
       if (size >= limit) {
         truncated = true;
@@ -1316,15 +1360,16 @@ export function runCommand(
       }, 50);
       tick.unref();
     };
+    // At the limit, the whole process group (a shell's children too) gets
+    // SIGTERM, then SIGKILL once the grace is up, whether or not
+    // `killGroup` asked for that on exit too: a command that ignores
+    // SIGTERM (`trap '' TERM`) never closed its pipes, and whatever waited
+    // on it (a worktree's setup before the first turn, its teardown before
+    // the cleanup, which messages, actions and handovers wait on) waited
+    // for ever (Codex's review, 9 Nov).
     const timer = setTimeout(() => {
       timedOut = true;
-      if (opts.killGroup) return endGroup();
-      // The whole process group: a shell's children too.
-      try {
-        process.kill(-child.pid!, 'SIGTERM');
-      } catch {
-        child.kill('SIGTERM');
-      }
+      endGroup();
     }, timeoutMs);
     child.stdout.on('data', take);
     child.stderr.on('data', take);
@@ -1333,7 +1378,7 @@ export function runCommand(
       let text = Buffer.concat(chunks).toString('utf8');
       // What fits in the limit, cut where no secret is split; stopped reading
       // part way, never in the run reading stopped in either (safe-cut.ts).
-      const fits = Buffer.byteLength(text, 'utf8') > LIMITS.toolResultText ? Buffer.from(text, 'utf8').subarray(0, LIMITS.toolResultText).toString('utf8').replace(/\uFFFD$/, '').length : text.length;
+      const fits = Buffer.byteLength(text, 'utf8') > maxBytes ? Buffer.from(text, 'utf8').subarray(0, maxBytes).toString('utf8').replace(/\uFFFD$/, '').length : text.length;
       if (truncated) text = text.slice(0, safeEndOfPartial(text, fits));
       else if (fits < text.length) {
         truncated = true;

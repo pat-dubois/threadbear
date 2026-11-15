@@ -75,13 +75,18 @@ final class AppModel {
     /// Whether threads read phone:messages (API 2) rather than phone:thread's
     /// newest 20 plus the runner's paging.
     var hasMessagePages: Bool { (apiVersion ?? 0) >= BackendCompatibility.messagePagesAPIVersion }
+    /// Whether to ask for the lines a thread writes when its login runs out
+    /// (role `note`): an older backend refuses the argument.
+    var hasLoginNotes: Bool { (apiVersion ?? 0) >= BackendCompatibility.loginNotesAPIVersion }
 
     /// Archived threads past the den's newest 100 with these words in
-    /// (API 16). Empty from an older backend, or when the call fails: the
-    /// search still shows what the phone has, so a failure isn't worth a toast.
+    /// (API 16), and from API 74 any thread with one in any message. Empty
+    /// from an older backend, or when the call fails: the search still
+    /// shows what the phone has, so a failure isn't worth a toast.
     func searchOlderArchived(_ text: String) async -> [PhoneThread] {
         guard let backend, (apiVersion ?? 0) >= BackendCompatibility.searchAPIVersion else { return [] }
-        return (try? await backend.search(text)) ?? []
+        let everywhere = (apiVersion ?? 0) >= BackendCompatibility.searchEverywhereAPIVersion
+        return (try? await backend.search(text, everywhere: everywhere)) ?? []
     }
     /// When this phone is notified, kept on the phone and sent to the backend
     /// with each registration and change (API 3).
@@ -141,6 +146,7 @@ final class AppModel {
     /// Whether the reply box's slash command palette can ask the runner
     /// for a thread's list (backend API 62, phone:slashCommands).
     var canUseSlashCommands: Bool { isFake || (apiVersion ?? 0) >= BackendCompatibility.slashCommandsAPIVersion }
+    var canStop: Bool { isFake || (apiVersion ?? 0) >= BackendCompatibility.stopAPIVersion }
     /// Each thread's slash commands once its runner has answered (SlashPaletteList).
     var slashCommands: [String: [SlashCommand]] = [:]
     /// Why a thread's list didn't come: its runner is away, or it failed.
@@ -397,6 +403,7 @@ final class AppModel {
         if args.contains("-ThreadbearFake") {
             // -ThreadbearSlowLoad: the lists answer after a few seconds, to see the loading rows.
             // -ThreadbearPictures: and a thread with pictures, "pics".
+            // -ThreadbearLoginNote: and one whose login ran out and moved, "moved".
             // -ThreadbearDiagrams: and one with a mermaid diagram and an html block.
             // -ThreadbearLong: and a very long thread, "long".
             // -ThreadbearSecret: and a thread waiting on a secret card, "secret".
@@ -404,7 +411,7 @@ final class AppModel {
             // -ThreadbearOffline: the Mac's been asleep for hours, so messages wait, and a3 has two waiting.
             let offline = args.contains("-ThreadbearOffline")
             // -ThreadbearManyThreads: and a long inbox, a few more running and starred, to scroll.
-            let fake = FakeBackend(runnerOnline: !offline, listDelay: args.contains("-ThreadbearSlowLoad") ? .seconds(6) : .zero, pictures: args.contains("-ThreadbearPictures"), long: args.contains("-ThreadbearLong"), secret: args.contains("-ThreadbearSecret"), diagrams: args.contains("-ThreadbearDiagrams"), runners: args.contains("-ThreadbearRunners"), queued: offline, many: args.contains("-ThreadbearManyThreads"))
+            let fake = FakeBackend(runnerOnline: !offline, listDelay: args.contains("-ThreadbearSlowLoad") ? .seconds(6) : .zero, pictures: args.contains("-ThreadbearPictures"), long: args.contains("-ThreadbearLong"), secret: args.contains("-ThreadbearSecret"), diagrams: args.contains("-ThreadbearDiagrams"), runners: args.contains("-ThreadbearRunners"), queued: offline, many: args.contains("-ThreadbearManyThreads"), loginMoved: args.contains("-ThreadbearLoginNote"))
             // -ThreadbearSlowStart: a new thread takes a minute to start, so its Starting row stays.
             if args.contains("-ThreadbearSlowStart") { fake.startDelay = .seconds(60) }
             // -ThreadbearShortInbox: one thread in the inbox, one running, one of each put away.
@@ -424,8 +431,8 @@ final class AppModel {
         #if DEBUG
         // `-ThreadbearPair <link>`: pair on launch, since the simulator asks
         // "Open in Threadbear?" for links from outside and nothing can tap it.
-        if let i = args.firstIndex(of: "-ThreadbearPair"), i + 1 < args.count, let link = URL(string: args[i + 1]) {
-            Task { await pair(with: link) }
+        if let i = args.firstIndex(of: "-ThreadbearPair"), i + 1 < args.count, let offered = Pairing.parse(args[i + 1], allowLocal: Self.allowLocalPairing) {
+            Task { await pair(with: offered) }
         }
         // `-ThreadbearOpen <threadId>`: start on that thread, for screenshots.
         if let i = args.firstIndex(of: "-ThreadbearOpen"), i + 1 < args.count { openThreadId = args[i + 1] }
@@ -808,35 +815,43 @@ final class AppModel {
     /// A yes is being checked with the server, for the pair screen's spinner.
     private(set) var isPairing = false
 
-    /// Every pairing link, from the Camera, the pair screen's scanner or the
-    /// clipboard, starts here: it's held for a yes and nothing is saved yet,
-    /// paired or not (an expired token used to let a link straight in).
-    func askToPair(_ link: URL) {
+    /// Every pairing code or link, from the pair screen's scanner, the
+    /// clipboard or another app, starts here: it's held for a yes and nothing
+    /// is saved yet, paired or not (an expired token used to let a link
+    /// straight in). One another app opened is never taken (Daybreak 127).
+    func askToPair(_ text: String, from source: PairingSource) {
         lastError = nil
-        switch pairingGate.ask(link, allowLocal: Self.allowLocalPairing, current: pairing ?? PairingStore.load(),
+        switch pairingGate.ask(text, from: source, allowLocal: Self.allowLocalPairing, current: pairing ?? PairingStore.load(),
                                keys: { Self.runnerKeys(for: $0) }) {
         case .asking: break
-        case .notPairing: lastError = "That link isn't a Threadbear pairing link."
-        case .busy: lastError = "Answer the pairing question first, then open the link again."
+        case .notPairing: lastError = "That isn't a Threadbear pairing code."
+        case .busy: lastError = "Answer the pairing question first, then scan the code again."
+        case .oldLink: lastError = "That code is from an older Threadbear on your Mac, which puts the phone's token in it. Update Threadbear on your Mac, then show the code again."
+        case .opened: lastError = "Threadbear doesn't pair from links other apps open. Scan the code on your Mac from Threadbear's own pairing screen instead."
         }
     }
 
     /// Mike said yes to `shown`. Synchronous, so the request is taken before
     /// the alert's dismissal cancels the gate.
     func acceptPairing(_ shown: PairingRequest) {
-        pairingGate.accept(shown) { [weak self] request in await self?.pair(with: request.link) }
+        pairingGate.accept(shown) { [weak self] request in await self?.pair(with: request.pairing) }
     }
 
-    /// From a `threadbear://pair` link Mike said yes to (or `-ThreadbearPair`
-    /// in a Debug build): checks the token works before keeping it.
-    private func pair(with link: URL) async {
-        guard let pairing = Pairing.parse(link, allowLocal: Self.allowLocalPairing) else {
-            lastError = "That link isn't a Threadbear pairing link."
-            return
-        }
+    /// From a pairing Mike said yes to (or `-ThreadbearPair` in a Debug
+    /// build): trades its one-use code for the token, if it has one, and
+    /// checks the token works before keeping it.
+    private func pair(with offered: Pairing) async {
         isPairing = true
         defer { isPairing = false }
-        let backend = ConvexBackend(deploymentURL: pairing.deploymentURL, token: pairing.token)
+        let transport = ConvexMobileTransport(deploymentURL: offered.deploymentURL)
+        let pairing: Pairing
+        do {
+            pairing = try await offered.claimed(with: transport)
+        } catch {
+            lastError = "The server didn't take that pairing code: \(error.localizedDescription)"
+            return
+        }
+        let backend = ConvexBackend(transport: transport, token: pairing.token)
         do {
             _ = try await backend.me()
             PairingStore.save(pairing)
@@ -1169,6 +1184,35 @@ final class AppModel {
             }
         }
     }
+
+    /// Threads whose Stop has been tapped and whose turn hasn't stopped
+    /// yet: Stop shows a spinner and takes no more taps meanwhile.
+    private(set) var stopping: Set<String> = []
+
+    /// Stop on a running thread (backend API 69). It stays a spinner until
+    /// the thread's row says the turn is over (`stopped(_:)`, from the
+    /// thread view), or the command fails, which says why.
+    func stop(threadId: String) {
+        guard let backend, !stopping.contains(threadId) else { return }
+        stopping.insert(threadId)
+        Task {
+            do {
+                let command = try await backend.interrupt(threadId: threadId)
+                for try await status in backend.command(command) {
+                    guard let status, status.state == .failed else { if status?.state == .done { return }; continue }
+                    stopping.remove(threadId)
+                    report(TransportError.server(status.note ?? "That Mac couldn't stop it."))
+                    return
+                }
+            } catch {
+                stopping.remove(threadId)
+                report(error)
+            }
+        }
+    }
+
+    /// The thread's turn is over: its Stop is done.
+    func stopped(_ threadId: String) { stopping.remove(threadId) }
 
     func clearError() { lastError = nil }
 

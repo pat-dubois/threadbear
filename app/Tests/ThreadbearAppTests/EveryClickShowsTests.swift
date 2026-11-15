@@ -12,10 +12,10 @@ final class EveryClickShowsTests: XCTestCase {
     /// RunnerAPI's calls that only read, or that nobody clicks for.
     private static let quiet: Set<String> = [
         "hello", "listThreads", "searchThreads", "samples", "renderPanel", "convexPanelDeployments",
-        "convexPanelLogin", "convexPanelKey", "threadHighlights", "threadCommands", "explain", "panelShown",
+        "convexPanelLogin", "convexPanelKey", "threadHighlights", "threadCommands", "contextUsage", "folderCommands", "explain", "panelShown",
         "events", "subscribe", "subagent", "unsubscribe", "markSeen", "startRequest", "importMedia", "usageStats",
         "listClis", "listSchedules", "listRunners", "remoteLogins", "remoteThreads", "previewSchedule",
-        "listProjects", "getProject", "refreshProjectTasks", "librarianStatus", "connectorsStatus", "listPools",
+        "movePreview", "listProjects", "getProject", "refreshProjectTasks", "librarianStatus", "connectorsStatus", "listPools", "threadSummary",
         // Not calls: helpers on the request types in the same file.
         "applied", "params",
     ]
@@ -26,13 +26,14 @@ final class EveryClickShowsTests: XCTestCase {
         "interrupt", "updateThread", "share", "tickAsk", "respond", "answerStartRequest", "approvePlan",
         "answerSecret", "checkClis", "updateCli", "setCliPolicy", "createSchedule", "updateSchedule",
         "deleteSchedule", "setRunnerOrder", "runSchedule", "createProject", "updateProject", "setProjectIcon",
-        "mergeProject", "deleteProject", "deleteThread", "setThreadProjects", "runLibrarian", "updateLibrarian", "savePools",
+        "mergeProject", "deleteProject", "deleteThread", "setThreadProjects", "runLibrarian", "updateLibrarian", "savePools", "moveThread", "cancelMove",
     ]
 
     /// Functions that show their click some other way, and how.
     private static let showsItsOwnWay: [String: String] = [
         "RemoteRunners.swift setRunnerOrder": "the rows move at once",
         "RemoteRunners.swift sendNewThread": "creatingThread: the Send button spins",
+        "NewApp.swift start": "starting: Start using the new app spins and is disabled",
         "ThreadSession.swift tickAsk": "the box changes at once",
         "ThreadSession.swift answerSecret": "async: the card awaits it and shows its own state",
         "PaneModel.swift removeHighlight": "the row goes at once",

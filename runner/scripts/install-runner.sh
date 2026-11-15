@@ -8,6 +8,11 @@
 #   scripts/install-runner.sh              install (or reinstall) and start it
 #   scripts/install-runner.sh --print      print the plist and change nothing
 #   scripts/install-runner.sh --uninstall  stop it and remove the plist
+#   scripts/install-runner.sh --stage      put the new app, launch.mjs and
+#                                          plist in place without stopping
+#                                          anything; they take over the next
+#                                          time the LaunchAgent starts (the
+#                                          Mac restarting, logging in again)
 #
 # The runner runs from a release, never from this checkout: the plist
 # starts <home>/runner/launch.mjs, which starts the release
@@ -34,6 +39,15 @@
 # Options:
 #   --from-source  run src/main.ts straight from this checkout instead, as
 #                  before releases (for debugging the runner itself)
+#   --stage        the runner's own reinstall (src/reinstall.ts): no busy
+#                  check, no release built (the runner's updater keeps those
+#                  up to date), and nothing stopped or loaded. Threadbear
+#                  Runner.app is rebuilt in place (the running one goes on
+#                  from the file it started from), launch.mjs copied in and
+#                  the plist rewritten; launchd reads them next time it
+#                  starts the job. On a Mac that's never idle that's the
+#                  only time one can go in without cutting threads short
+#                  (14 Nov 2026).
 #   --force        replace the running copy even if threads are busy
 #   --allow-branch install from a HEAD that isn't main's tip (its launch.mjs
 #                  and release)
@@ -43,7 +57,9 @@
 #                  8797). A sandbox next to the real runner needs its own
 #                  --home and --label; its port defaults to 0, a free one.
 #   --node PATH    Node 24 binary to pin in the plist
-#                  (default: $THREADBEAR_NODE, else ~/.nvm/versions/node/v24.22.1/bin/node)
+#                  (default: $THREADBEAR_NODE, else the node on PATH, else
+#                  nvm's newest Node 24 or newer, or Homebrew's; a
+#                  Homebrew Cellar path is pinned as its opt/ link)
 #   --runner-app DIR  where Threadbear Runner.app goes (default:
 #                  $THREADBEAR_RUNNER_APP_DIR, else ~/Applications/Threadbear
 #                  Runner.app, or <home>/runner/Threadbear Runner.app for a
@@ -62,7 +78,7 @@ for v in $(compgen -e | grep '^THREADBARE_' || true); do n="THREADBEAR_${v#THREA
 DEFAULT_LABEL="com.mikerosoft.threadbear.runner"
 DEFAULT_HOME="$HOME/Library/Application Support/Threadbear"
 RUNNER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NODE="${THREADBEAR_NODE:-$HOME/.nvm/versions/node/v24.22.1/bin/node}"
+NODE="${THREADBEAR_NODE:-}"
 LAUNCHCTL="${THREADBEAR_LAUNCHCTL:-launchctl}"
 AGENTS_DIR="${THREADBEAR_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 # A runner on Linux (INSTALL.md, "A runner on Linux"): systemd keeps it up.
@@ -76,6 +92,7 @@ PORT=""
 AGENT_PATH=""
 RUNNER_APP="${THREADBEAR_RUNNER_APP_DIR:-}"
 FROM_SOURCE=0
+STAGE=0
 FORCE=0
 ALLOW_BRANCH=0
 HOME_GIVEN=0
@@ -87,6 +104,7 @@ while [ $# -gt 0 ]; do
     --print) MODE="print" ;;
     --uninstall) MODE="uninstall" ;;
     --from-source) FROM_SOURCE=1 ;;
+    --stage) STAGE=1 ;;
     --force) FORCE=1 ;;
     --allow-branch) ALLOW_BRANCH=1 ;;
     --home) DATA_HOME="${2:?--home needs a folder}"; HOME_GIVEN=1; shift ;;
@@ -100,9 +118,49 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+if [ "$STAGE" = 1 ] && { [ "$MODE" != "install" ] || [ "$FROM_SOURCE" = 1 ]; }; then
+  echo "--stage only goes with a plain install (not --print, --uninstall or --from-source)." >&2
+  exit 1
+fi
+
+# Only once the arguments are read, so --node wins. Uninstalling needs no
+# Node, so a missing one is said where installing needs it, below.
+if [ -z "$NODE" ]; then
+  . "$RUNNER_DIR/scripts/find-node.sh"
+  NODE="$(threadbear_find_node 2>/dev/null)" || NODE=""
+fi
+
+# A Homebrew Node under Cellar/<formula>/<version> is deleted by the next
+# `brew upgrade`, and a runner pinned to it can't start Node again: no
+# restart, no deploy, no release build. Node gives its own path with links
+# resolved, so a runner started on /opt/homebrew/bin/node hands its threads
+# (and so this script, through THREADBEAR_NODE) the Cellar one. Pin the
+# formula's opt/ link instead, which Homebrew moves to each new version
+# (teodorboev's fork, 9 Nov 2026). Only when opt/ leads to this same Node:
+# one pointing at another version (or a folder that's merely named Cellar)
+# would swap in a Node nobody chose, even over --node (Codex's review).
+if [[ "$NODE" =~ ^(.*)/Cellar/([^/]+)/[^/]+/bin/node$ ]]; then
+  opt_node="${BASH_REMATCH[1]}/opt/${BASH_REMATCH[2]}/bin/node"
+  if [ -x "$opt_node" ] && [ "$(cd "$(dirname "$opt_node")" 2>/dev/null && pwd -P)" = "$(cd "$(dirname "$NODE")" 2>/dev/null && pwd -P)" ]; then
+    NODE="$opt_node"
+  fi
+fi
 
 case "$DATA_HOME" in /*) ;; *) DATA_HOME="$PWD/$DATA_HOME" ;; esac
 DATA_HOME="${DATA_HOME%/}"
+
+# Whether $DATA_HOME/runner.json is there but broken (launch.mjs,
+# runnerJsonBroken). A runner from before 9 Nov reads a broken one as {}
+# and writes over it, so nothing here starts or goes back to one then.
+runner_json_broken() {
+  "$NODE" --input-type=module -e 'const { runnerJsonBroken } = await import(process.argv[1]); process.exit(runnerJsonBroken(process.argv[2]) ? 0 : 1)' "file://$RUNNER_DIR/launch.mjs" "$DATA_HOME" 2>/dev/null
+}
+
+if runner_json_broken; then
+  echo "$DATA_HOME/runner.json isn't valid JSON. Fix it first: the runner won't start on it, and one from before 9 Nov would write over it." >&2
+  exit 1
+fi
+
 
 # Same folder, even through a symlink (/tmp is /private/tmp).
 same_dir() {
@@ -232,12 +290,17 @@ if [ "$MODE" = "uninstall" ]; then
   rm -f "$PLIST"
   [ "$LINUX" = 0 ] || "$SYSTEMCTL" --user daemon-reload 2>/dev/null || true
   echo "Removed $LABEL. The data in $DATA_HOME (releases included) is untouched."
+  [ "$SANDBOX" = 1 ] || bash "$RUNNER_DIR/scripts/link-tb.sh" --remove || true
   # The app stays too: the privacy grants macOS gave it belong to it, and a
   # reinstall picks it up as it is.
   [ "$LINUX" = 1 ] || [ ! -d "$RUNNER_APP" ] || echo "$RUNNER_APP stays; delete it yourself if you're done with Threadbear."
   exit 0
 fi
 
+if [ -z "$NODE" ]; then
+  echo "No Node 24 or newer on PATH, in nvm or in Homebrew. Install it, or pass --node /path/to/node." >&2
+  exit 1
+fi
 if [ ! -x "$NODE" ]; then
   echo "No Node binary at $NODE. Pass --node /path/to/node (Node 24 or newer)." >&2
   exit 1
@@ -381,7 +444,9 @@ fi
 
 # deploy-runner.sh, on the Node the plist pins.
 deploy() {
-  THREADBEAR_NODE="$NODE" bash "$RUNNER_DIR/scripts/deploy-runner.sh" --home "$DATA_HOME" --label "$LABEL" "$@"
+  # THREADBEAR_DEPLOY_NODE_GIVEN: this is the Node being installed, which
+  # the plist may not name yet, so deploy.mjs takes it as it is.
+  THREADBEAR_NODE="$NODE" THREADBEAR_DEPLOY_NODE_GIVEN=1 bash "$RUNNER_DIR/scripts/deploy-runner.sh" --home "$DATA_HOME" --label "$LABEL" "$@"
 }
 
 # Loads $PLIST and starts it. Straight after a bootout, bootstrap can fail
@@ -435,6 +500,10 @@ point_current() {
 }
 
 RDIR="$DATA_HOME/runner"
+# The exit for "threads are busy, nothing changed": EX_TEMPFAIL, so the
+# runner reinstalling itself (src/reinstall.ts) tells it from a failure and
+# tries again once they've finished.
+BUSY_EXIT=75
 LOADED=0
 svc_loaded && LOADED=1
 
@@ -451,14 +520,20 @@ if [ "$FROM_SOURCE" = 0 ] && [ "$ALLOW_BRANCH" = 0 ] && ! deploy --check-branch;
 fi
 # Replacing a running copy stops its CLIs, and every turn and background
 # job with them, so only when nothing is busy.
-if [ "$LOADED" = 1 ] && [ "$FORCE" = 0 ]; then
+# Staging something that isn't installed would leave a plist launchd never
+# loaded, or a launch.mjs with no release to start.
+if [ "$STAGE" = 1 ] && { [ "$LOADED" = 0 ] || [ ! -f "$RDIR/launch.mjs" ] || [ ! -L "$RDIR/current" ]; }; then
+  echo "$LABEL isn't installed and running releases, so there's nothing to stage over. Run this without --stage." >&2
+  exit 1
+fi
+if [ "$LOADED" = 1 ] && [ "$FORCE" = 0 ] && [ "$STAGE" = 0 ]; then
   if [ "$LAUNCH_OK" = 0 ]; then
     echo "$RUNNER_DIR/launch.mjs doesn't load (above), so this can't check whether threads are busy. Fix it, or add --force." >&2
     exit 1
   fi
   if ! deploy --check-idle; then
     echo "Not replacing the running $LABEL while threads are busy: they'd be cut short. Run this again once they finish, or add --force." >&2
-    exit 1
+    exit "$BUSY_EXIT"
   fi
 fi
 
@@ -480,6 +555,37 @@ rm -f "$PREV" "$PREV_LAUNCH"
 # fewer rebuilds the better; a rebuild signs it the same way regardless).
 # build-launcher.sh leaves the old app next to the new one as
 # .Threadbear Runner.app.old, so a failed install can put it back.
+# Staging writes the plist first, to a temp file beside it, so a
+# LaunchAgents folder it can't write to fails before the app or launch.mjs
+# change: one of those going in alone would make the runner's check see main
+# and stop saying anything was wrong, with the old plist still there.
+STAGED_PLIST=""
+# The Node the job runs on now. Staging a different one would leave
+# deploy-runner.sh checking releases on the staged Node (it reads the plist)
+# while the running supervisor starts them on its own until the next login,
+# so a Node change goes in by a full reinstall instead.
+if [ "$STAGE" = 1 ] && [ -f "$PLIST" ]; then
+  if [ "$LINUX" = 1 ]; then
+    PINNED="$(sed -n 's/^ExecStart="\([^"]*\)".*/\1/p' "$PLIST" | head -n 1)"
+  else
+    PINNED="$(plutil -extract ProgramArguments.1 raw -o - "$PLIST" 2>/dev/null || true)"
+  fi
+  if [ -n "$PINNED" ] && [ "$PINNED" != "$NODE" ]; then
+    echo "The LaunchAgent runs on $PINNED, and this would stage $NODE. Changing the Node needs a full reinstall: run this without --stage once no thread is busy." >&2
+    exit 1
+  fi
+fi
+if [ "$STAGE" = 1 ]; then
+  STAGED_PLIST="$(mktemp "$PLIST.XXXXXX")" || { echo "Couldn't write to $AGENTS_DIR, so nothing was changed." >&2; exit 1; }
+  # Not left in LaunchAgents if a step below stops this (once it's moved
+  # into place there's nothing at this name to remove).
+  trap 'rm -f "$STAGED_PLIST"' EXIT
+  if ! job_file > "$STAGED_PLIST" || { [ "$LINUX" = 0 ] && ! plutil -lint "$STAGED_PLIST" >/dev/null; }; then
+    rm -f "$STAGED_PLIST"
+    echo "Couldn't write the new plist, so nothing was changed." >&2
+    exit 1
+  fi
+fi
 OLD_APP="$(dirname "$RUNNER_APP")/.$(basename "$RUNNER_APP").old"
 APP_BUILT=0
 [ "$LINUX" = 1 ] || rm -rf "$OLD_APP"
@@ -517,7 +623,9 @@ else
   # when it was built from HEAD.
   [ ! -L "$RDIR/current" ] || OLD_CURRENT="$(basename "$(readlink "$RDIR/current")")"
   HEAD_COMMIT="$(git -C "$RUNNER_DIR" rev-parse HEAD 2>/dev/null || true)"
-  if [ -n "$OLD_CURRENT" ] && [ -n "$HEAD_COMMIT" ] && [ "$(release_commit "$RDIR/current/release.json")" = "$HEAD_COMMIT" ]; then
+  if [ "$STAGE" = 1 ]; then
+    echo "Leaving release ${OLD_CURRENT:-?} as it is; the runner's updater keeps releases up to date."
+  elif [ -n "$OLD_CURRENT" ] && [ -n "$HEAD_COMMIT" ] && [ "$(release_commit "$RDIR/current/release.json")" = "$HEAD_COMMIT" ]; then
     echo "Keeping release $OLD_CURRENT, which was built from HEAD."
   else
     [ -z "$OLD_CURRENT" ] || echo "Release $OLD_CURRENT wasn't built from HEAD, so building one that is."
@@ -551,7 +659,12 @@ fail_back() {
       if [ "$HAD_LAUNCH" = 1 ]; then mv -f "$PREV_LAUNCH" "$RDIR/launch.mjs"; else rm -f "$RDIR/launch.mjs"; fi
     fi
     if [ "$BUILT" = 1 ] && [ -n "$OLD_CURRENT" ]; then
-      point_current "$OLD_CURRENT" && echo "current points at $OLD_CURRENT again." >&2
+      if runner_json_broken; then
+        # Why the new release wouldn't start; the old one could write over it.
+        echo "$DATA_HOME/runner.json isn't valid JSON, so current stays on the new release rather than going back to $OLD_CURRENT, which could write over it. Fix runner.json and run this again." >&2
+      else
+        point_current "$OLD_CURRENT" && echo "current points at $OLD_CURRENT again." >&2
+      fi
     fi
     if reload; then
       echo "Back as it was. The log above says what went wrong; fix it and run this again." >&2
@@ -580,6 +693,39 @@ fail_back() {
   [ -z "$NEW_LAUNCH" ] || rm -f "$NEW_LAUNCH"
   exit 1
 }
+
+if [ "$STAGE" = 1 ]; then
+  # Each file goes in whole (a temp file and a rename), and nothing is
+  # stopped or loaded, so nothing needs putting back if a step fails: the
+  # running job carries on as it was, and the next run of this stages
+  # again. The app was rebuilt in place above; the running launcher goes
+  # on from the file it started from.
+  mv "$STAGED_PLIST" "$PLIST"
+  mv -f "$NEW_LAUNCH" "$RDIR/launch.mjs"
+  # systemd keeps a unit's old text until told; this rereads it without
+  # restarting anything.
+  [ "$LINUX" = 0 ] || "$SYSTEMCTL" --user daemon-reload 2>/dev/null || true
+  [ "$LINUX" = 1 ] || rm -rf "$OLD_APP"
+  if [ "$SANDBOX" = 0 ]; then bash "$RUNNER_DIR/scripts/link-tb.sh" "$DATA_HOME" "$NODE" "$RUNNER_DIR" || true; fi
+  echo "Staged $LABEL: the new app, launch.mjs and plist are in place, and nothing was stopped."
+  echo "They take over the next time the LaunchAgent starts (the Mac restarting, or logging in again)."
+  exit 0
+fi
+
+# Building the app and a release can take minutes, and a thread may have
+# started meanwhile (the runner reinstalling itself starts this unattended),
+# so busy is asked again right before anything is stopped. Only the app is
+# changed by then; it goes back, and the release just built stays for the
+# runner's next restart, as one its updater built would.
+if [ "$LOADED" = 1 ] && [ "$FORCE" = 0 ] && ! deploy --check-idle; then
+  if [ "$APP_BUILT" = 1 ] && [ -d "$OLD_APP" ]; then
+    rm -rf "$RUNNER_APP"
+    mv "$OLD_APP" "$RUNNER_APP"
+  fi
+  [ -z "$NEW_LAUNCH" ] || rm -f "$NEW_LAUNCH"
+  echo "A thread got busy while this was building, so the running $LABEL wasn't replaced. Run this again once it finishes, or add --force." >&2
+  exit "$BUSY_EXIT"
+fi
 
 [ ! -f "$PLIST" ] || cp "$PLIST" "$PREV"
 # An EXIT trap rather than ERR: it also covers set -e exits inside
@@ -627,6 +773,13 @@ else
 fi
 trap - EXIT
 rm -f "$PREV" "$PREV_LAUNCH"
+# tb in ~/.local/bin, so the tb commands setup prints run (issue #39). Only
+# for the real data dir: a sandbox's tb would talk to the wrong runner.
+if [ "$SANDBOX" = 0 ]; then
+  TB_ARGS=("$DATA_HOME" "$NODE" "$RUNNER_DIR")
+  [ "$FROM_SOURCE" = 0 ] || TB_ARGS+=(--from-source)
+  bash "$RUNNER_DIR/scripts/link-tb.sh" "${TB_ARGS[@]}" || true
+fi
 [ "$LINUX" = 1 ] || rm -rf "$OLD_APP"
 if [ "$LINUX" = 1 ]; then
   echo "Restart it with: systemctl --user restart $UNIT"
@@ -647,6 +800,8 @@ echo "Restart it with: launchctl kickstart -k $DOMAIN/$LABEL"
 echo
 echo "If nobody sits at this Mac, give Threadbear Runner Full Disk Access:"
 echo "  System Settings > Privacy & Security > Full Disk Access, then add $RUNNER_APP"
-if [ "$SANDBOX" = 0 ] && [ ! -d "/Applications/Threadbear.app" ] && [ ! -d "$HOME/Applications/Threadbear.app" ]; then
+# THREADBEAR_INSTALL_QUIET: the runner reinstalling itself, with nobody
+# there to have asked for a settings window.
+if [ -z "${THREADBEAR_INSTALL_QUIET:-}" ] && [ "$SANDBOX" = 0 ] && [ ! -d "/Applications/Threadbear.app" ] && [ ! -d "$HOME/Applications/Threadbear.app" ]; then
   open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles" 2>/dev/null || true
 fi

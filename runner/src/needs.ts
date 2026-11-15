@@ -104,6 +104,22 @@ function done(v: unknown): Needs {
   return next.length ? { needs: 'nothing', next } : { needs: 'nothing' };
 }
 
+// end_turn took `open` from 11 to 13 Nov 2026: lines the agent wrote for
+// the done card's "Still open" list, for what it was waiting on that the
+// runner can't see. Of the 14 on Mike's cards on 13 Nov none gave him
+// anything to do or click ("Geoff putting the portal and lights pieces
+// into the next newsletter"): nine were the thread's own job still going,
+// which the runner knows (loose-ends.ts, runningLooseEnds), and the rest
+// waited on other people. So the card lists only what the runner checked.
+// A session from before still has the argument: its lines are dropped,
+// and it's told where they go instead.
+export function droppedOpenLines(input: unknown): boolean {
+  const open = input && typeof input === 'object' ? (input as Record<string, unknown>).open : undefined;
+  return Array.isArray(open) && open.some((l) => typeof l === 'string' && l.trim() !== '');
+}
+
+export const OPEN_GONE = ' Your "open" lines aren\'t shown any more: say them in your reply instead. If there\'s more for you to do once someone answers, call end_turn again with snooze.';
+
 // Big enough for any turn's story; past this it's the working again.
 const MAX_SUMMARY = 8;
 const MAX_BULLET = 400;
@@ -437,9 +453,15 @@ const NEXT_ROW =
   'No names from the code or your working (a class, a file, a tool, a nickname for something); describe what it does instead. ' +
   '8 to 15 words: "Stop the Threadbear transcript jumping when a long reply arrives", not "Fix the ScrollAnchor drift". ';
 
+// A queued remote job is still owned by this CLI. A saved continuation
+// preserves the next message, not the process (thread 879afc1e, 14 Nov).
+const END_TURN_BACKGROUND =
+  'Archiving or hibernating stops this CLI\'s background jobs, including shell jobs waiting in a queue. Leave archive, snooze and waitFor out while they run; use schedule_message to check later. ';
+
 // Hibernating itself, in every form's description (snoozeFromTool).
 const END_TURN_SNOOZE =
-  'snooze hibernates this thread once the turn is over, with needs "nothing" only, until a time ("2h", "1d", "tomorrow", an ISO time with its offset, "restart", or "release" for a new release) or words saying when ("when the phone arrives"). Use it when the user asks for this thread to be snoozed or hibernated, or when the rest waits on a message (one wakes it), until it should have come; waitFor names threads it waits on, which wake it when they finish. ';
+  END_TURN_BACKGROUND +
+  'snooze hibernates this thread once the turn is over, with needs "nothing" only, until a time ("2h", "1d", "tomorrow", an ISO time with its offset, "restart", or "release" for a new release) or words saying when ("when the phone arrives"). Use it when the user asks for this thread to be snoozed or hibernated, or when the rest waits on a message (one wakes it), until it should have come; it only brings the thread back, so a step of your own later is a schedule_message, except words for something to happen ("until X ships"), which wake you with a turn to check. waitFor names threads it waits on, which wake it when they finish. ';
 
 // Handing a step over, in every form's description. This used to say to offer
 // "Can you do it?" when the agent could plausibly do the step itself, which told
@@ -573,13 +595,20 @@ const CODEX_MESSAGE_END_TURN_DESCRIPTION =
 // long turn or in a thread another agent started, as the reply reported
 // only the latest step (28cee9ef: one experiment's result, never the plan
 // it was for). One line, only then: he likes replies at their usual length.
+// "What they asked" and "a few words on what it is": trying Ghostex's
+// coordinator on 9 Nov 2026, Mike lost track of replies that answered his
+// earlier question without saying which, and refused "Merge these 8 in
+// this order: #38, #24, #25..." for want of what each one was and how
+// serious ("I need more context on what these things are").
 const ONE_REPLY_REPLY =
   'Then write your reply as ordinary text straight after it, as your final message. ' +
   'That reply is the only text the user sees from this turn: everything you write before end_turn folds away into your working, out of sight. So don\'t write your answer before calling it, and call no tools after it. ' +
   'The reply: lead with the point and keep it as short as it can be while they can act on it without reading your working. ' +
   'If they may have lost track (a long turn, work picked up from another thread, a thread they didn\'t start), open with one line on what the work is for and where it stands, before the latest step. ' +
+  'If it answers something they asked earlier (a note on a card, a follow-up question), open by saying what they asked. ' +
   'A work report is a few bullets of what changed and the result, each linked to where it can be checked: [tests pass](work:npm test) quotes a few words of a step in your working (the command you ran or its description) and opens it there, lit up; [its own thread](thread:<its id from list_threads>) opens another thread; web pages and files link as usual. ' +
   'An explanation, a draft or an answer to their question is prose, at the length it needs. ' +
+  'When they\'re deciding about several things (PRs, commits, findings), give each a few words on what it is, as they\'d see it, and how serious: never bare numbers or ids. A security question first says who could do what. ' +
   'When you\'re asking something, include the full draft to approve (text to send elsewhere goes in a ```slack, ```email or ```draft block, shown line for line with a Copy button) or the options to choose from in the reply. The question itself, and what each answer would do, are in the card under the reply, so don\'t repeat them. ' +
   'Never write a "What I need from you" section, a "Nothing needed from you" line or a list of follow-ups in the reply: asks and next are those. ';
 
@@ -588,6 +617,7 @@ const ONE_REPLY_REPLY =
 // them twice (runner/context-budget.json). Checked in the end_turn eval
 // (~/dev/me/misc/end-turn-eval/v3, "trim") before landing.
 const ONE_REPLY_FIELDS =
+  END_TURN_BACKGROUND +
   TRY_IT_FIRST +
   ONLY_THEY_CAN_TRY +
   'next is only for when nothing is needed: up to 3 follow-ups that really came up and that you\'d tell the user are worth doing; usually none, and never something you\'d call optional or low priority. ' +
@@ -682,6 +712,91 @@ export const ONE_REPLY_END_TURN_NUDGE =
 export const ONE_REPLY_WRITE_NUDGE =
   'Write your reply now, as ordinary text: the user sees only what you write after end_turn, with the card under it. ' +
   'Include any requested draft, explanation or descriptions of choices in full. Leave the question and button labels on the card.';
+
+// A reply that closes by asking the user for an answer, under an end_turn that
+// said nothing was needed: the thread shows as done, with no card to answer
+// on. In the week to 13 Nov 2026 two real questions went out that way among
+// some 1,800 done turns ("Which do you want to start with?", thread 7a98a6fd;
+// "Say go and I'll merge main into prod", 0222c475), and Mike picked a check
+// over wider wording: the Stop hook sends the turn back once for the card
+// (adapter.ts, onStop). Only a question or a go-ahead: an optional offer
+// ("tell me if you want X and I'll set it up") stays a sentence, which he
+// chose over rows on the done card. Returns the asking sentence, for the nudge
+// to quote.
+// A draft for someone else (a fenced block, a quote) isn't the agent asking.
+const FENCE = /^\s*(?:```|~~~)/;
+// Mid-paragraph, only a question that is plainly put to the user: "Why does
+// this matter? Because..." is the agent talking.
+const TO_THE_USER = /^(?:want me to|shall i|should i|do you want|would you like|which (?:one|of|do|would|should)|can i|may i|ok(?:ay)? (?:to|if)|is it ok(?:ay)?|are you (?:happy|ok(?:ay)?)|happy for me to|ready for me to)\b/i;
+// "Say go and I'll...", "Reply yes to...", "...once you say the word". Not
+// "I'd say yes", which is the agent's own view.
+const GO = '(?:(?:the|a|your)\\s+)?["“\'‘`*]*(?:go(?:[- ]ahead)?|yes|ok(?:ay)?|the word|the nod)["”\'’`*]*(?=[\\s,.:;!)]|$)';
+const SAY_GO = new RegExp(`^(?:just\\s+|so\\s+)?(?:say|reply|type|send|give me)\\s+${GO}|\\b(?:when|once|if|until|as soon as)\\s+you\\s+(?:say|give(?:\\s+me)?)\\s+${GO}`, 'i');
+
+export function replyAsks(reply: string): string | undefined {
+  const lines: string[] = [];
+  let fenced = false;
+  for (const line of reply.replace(/\r\n/g, '\n').split('\n')) {
+    if (FENCE.test(line)) {
+      fenced = !fenced;
+      // A block breaks the paragraph around it.
+      lines.push('');
+    } else if (fenced || /^\s*>/.test(line)) lines.push('');
+    else lines.push(line);
+  }
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  let from = lines.length;
+  while (from > 0 && lines[from - 1].trim()) from--;
+  // The closing paragraph, or the list it ends with: each line on its own, as
+  // a sentence doesn't run across list items.
+  const closing = lines.slice(from).slice(-12);
+  const sentences = closing.flatMap((l) => sentencesOf(l));
+  if (!sentences.length) return undefined;
+  const last = sentences[sentences.length - 1];
+  if (/\?$/.test(last)) return last;
+  for (let i = sentences.length - 1; i >= 0; i--) {
+    const s = sentences[i];
+    if (SAY_GO.test(s) || (/\?$/.test(s) && TO_THE_USER.test(s))) return s;
+  }
+  return undefined;
+}
+
+// A line's sentences, without its list mark or the markdown around them.
+function sentencesOf(line: string): string[] {
+  const text = line.replace(/^\s*(?:\d{1,2}[.)]|[-*•])\s+/, '').trim().slice(-1200);
+  const out: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (!'.!?'.includes(text[i])) continue;
+    // The end of a sentence: the marks, any closing quote or emphasis, then
+    // a space or the end. Not the dot in "convex.dev" or "v1.2".
+    let end = i + 1;
+    while (end < text.length && '.!?"”\'’*_)`'.includes(text[end])) end++;
+    if (end < text.length && !/\s/.test(text[end])) continue;
+    out.push(tidy(text.slice(start, end)));
+    start = end;
+    i = end - 1;
+  }
+  if (start < text.length) out.push(tidy(text.slice(start)));
+  return out.filter(Boolean);
+}
+
+// A closing quote stays on, so words the agent is quoting (someone asks "how
+// is this different?") don't end in the question mark and aren't its question.
+function tidy(sentence: string): string {
+  return sentence.trim().replace(/^[*_`(]+/, '').replace(/[*_`)\s]+$/, '');
+}
+
+export const REPLY_ASKS = 'Your reply closes by asking the user something';
+export function replyAsksNudge(sentence: string): string {
+  const quoted = sentence.length > 160 ? `${sentence.slice(0, 160)}…` : sentence;
+  return (
+    `${REPLY_ASKS} ("${quoted}"), but your end_turn said nothing is needed, so the thread shows as done with no card to answer on. ` +
+    'If you need their answer before you can go on, call end_turn again now with needs "you" and that as its ask, with its likely answers as options (a go-ahead takes "Go" and "Not yet"). ' +
+    "Your message above is the reply: don't write it again, and write nothing else. " +
+    'If it needs no answer from them, stop here with no more text.'
+  );
+}
 
 // What a compaction between an accepted one-reply end_turn and its reply
 // adds after the summary (adapter.ts, onCompact), with the card's
@@ -899,18 +1014,39 @@ export class WakeRead {
   // to the model before it, so it waits for results of its own (from Codex's
   // review). At worst that opens the turn once more than needed.
   private next = false;
+  // A result in the batch that hands it over (before or after the note) was
+  // an end_turn saying "Now write your reply": the text the agent writes next
+  // is that reply, not something it did about the notice, so only a tool call
+  // after it opens the turn. Cleared at each of the agent's steps otherwise. On 11 Nov 2026 an
+  // ffmpeg job's exit came with that answer; the reply counted as reading it,
+  // the Stop hook asked for end_turn again, and the "Done." written after the
+  // second one took the reply's place (thread dcdc60a3).
+  private batchReply = false;
   get handed(): boolean {
     return this.state === 'handed';
   }
-  see(e: { type: string; itemId?: string; wake?: true }): boolean {
+  // The agent's own end_turn calls, so only their results count for
+  // batchReply, not a command's output that quotes one (from Codex's review).
+  private endTurns = new Set<string>();
+  see(e: { type: string; itemId?: string; name?: string; wake?: true; ok?: boolean; text?: string }): boolean {
+    if (e.type === 'tool.call' && e.itemId && e.name?.endsWith(`__${END_TURN_TOOL}`) && !e.itemId.includes('/')) this.endTurns.add(e.itemId);
     if (e.type === 'system.note' && e.wake) {
       if (this.state === 'handed') this.next = true;
       else this.state = 'unread';
       return false;
     }
+    // Any result in the batch, before the note as well as after it (from
+    // Codex's review).
+    if (e.type === 'tool.result' && e.itemId && this.endTurns.has(e.itemId) && typeof e.text === 'string' && endTurnWantsReply({ ok: e.ok === true, text: e.text })) this.batchReply = true;
     if (e.type === 'tool.result' && this.state === 'unread') this.state = 'handed';
     // A Codex child's items (<child>/<id>) aren't the agent's own steps.
-    else if (this.state === 'handed' && (e.type === 'assistant.text' || e.type === 'reasoning' || e.type === 'tool.call') && !e.itemId?.includes('/')) {
+    else if ((e.type === 'assistant.text' || e.type === 'reasoning' || e.type === 'tool.call') && !e.itemId?.includes('/')) {
+      if (this.state !== 'handed') {
+        this.batchReply = false;
+        return false;
+      }
+      if (this.batchReply && e.type !== 'tool.call') return false;
+      this.batchReply = false;
       this.state = this.next ? 'unread' : 'none';
       this.next = false;
       return true;
@@ -920,7 +1056,36 @@ export class WakeRead {
   reset(): void {
     this.state = 'none';
     this.next = false;
+    this.batchReply = false;
+    this.endTurns.clear();
   }
+}
+
+// What end_turn says to a call the agent wrote before it could have read a
+// message the user sent into the turn. The CLI holds such a message until the
+// response being written is finished and its tools have run, so a card in
+// that response can't be about it. On 13 Nov 2026 (thread 0222c475) Mike's
+// "Should we get it into production?" landed 30 ms before the end_turn that
+// closed off his last answers, with needs "nothing". The agent read it with
+// "Now write your reply", thought "I've already ended my turn, so I can't ask
+// him for approval", and wrote "Say go and I'll merge main into prod" over a
+// done card; a second end_turn would have been refused as a repeat, as the
+// message was in the events before the call. Refused, the call costs one
+// more, and the card that follows covers the message too. Only Claude's CLI
+// says when it hands a message over (adapter.ts, unreadMessage).
+// A sub-agent's end_turn mustn't use the refusal up, so only a call that
+// has reached the thread's events is checked (threadbear-mcp.ts).
+export const UNREAD_MESSAGE = 'Not ended: the user sent a message while you were writing this call, and you have not read it yet.';
+export function unreadMessageRefusal(): string {
+  // Not "answer it": with one reply the answer comes after end_turn, and
+  // one written before it is hidden with the work (from Codex's review).
+  return `${UNREAD_MESSAGE} It comes with this result. Read it and do any work it asks for, then call end_turn again as you normally would, for the turn as a whole.`;
+}
+
+// That refusal, read back: the call's card was written without the message,
+// so the runner doesn't keep it for a turn that ends with no other (runner.ts).
+export function endTurnRefusedUnread(result: { text: string }): boolean {
+  return result.text.startsWith(UNREAD_MESSAGE);
 }
 
 export function endedThisTurn(events: PersistedEvent[], serverName = 'threadbear'): boolean {

@@ -37,7 +37,7 @@ public final class FakeBackend: Backend, @unchecked Sendable {
     /// for the new thread sheet's runner picker. Left out of the usual samples.
     /// `queued`: with the runner offline, a3 already has two messages
     /// waiting for it, for the screenshots.
-    public init(now: Date = .now, turnDelay: Duration = .seconds(2), runnerOnline: Bool = true, listDelay: Duration = .zero, pictures: Bool = false, long: Bool = false, secret: Bool = false, diagrams: Bool = false, runners: Bool = false, queued: Bool = false, many: Bool = false) {
+    public init(now: Date = .now, turnDelay: Duration = .seconds(2), runnerOnline: Bool = true, listDelay: Duration = .zero, pictures: Bool = false, long: Bool = false, secret: Bool = false, diagrams: Bool = false, runners: Bool = false, queued: Bool = false, many: Bool = false, loginMoved: Bool = false) {
         let sample = Self.sample(now: now)
         threadsById = Dictionary(uniqueKeysWithValues: sample.threads.map { ($0.threadId, $0) })
         messagesById = sample.messages
@@ -47,6 +47,11 @@ public final class FakeBackend: Backend, @unchecked Sendable {
             threadsById[thread.thread.threadId] = thread.thread
             messagesById[thread.thread.threadId] = thread.messages
             imagesById[thread.thread.threadId] = thread.images
+        }
+        if loginMoved {
+            let thread = Self.loginMovedThread(now: now)
+            threadsById[thread.thread.threadId] = thread.thread
+            messagesById[thread.thread.threadId] = thread.messages
         }
         if long {
             let thread = Self.longThread(now: now)
@@ -187,6 +192,27 @@ public final class FakeBackend: Backend, @unchecked Sendable {
             </div>
             ```
             """, at: ago(1)),
+        ]
+        return (thread, messages)
+    }
+
+    // MARK: A thread whose login ran out
+
+    /// `-ThreadbearLoginNote`: a thread that hit its login's limit part way
+    /// through, moved to another login and carried on, with the runner's
+    /// line saying so ("moved").
+    private static func loginMovedThread(now: Date) -> (thread: PhoneThread, messages: [PhoneMessage]) {
+        let ago = { (minutes: Double) in now.addingTimeInterval(-minutes * 60) }
+        let thread = PhoneThread(threadId: "moved", title: "Land the error bar fix", cwd: "~/dev/threadbear", preview: "The fix is on main now.", lastActivityAt: ago(1))
+        let messages = [
+            PhoneMessage(seq: 1, role: .user, text: "Land the error bar fix on main and tell me when it's there.", at: ago(30)),
+            PhoneMessage(seq: 2, role: .tool, text: "Land the fix on main", toolKind: "command", turn: "aaaa1111", at: ago(29)),
+            PhoneMessage(seq: 3, role: .assistant, text: "The landing is running, behind two others in the queue.", turn: "aaaa1111", at: ago(28)),
+            PhoneMessage(seq: 4, role: .assistant, text: "You've hit your 5-hour limit · resets 11:30am", turn: "bbbb2222", at: ago(7)),
+            PhoneMessage(seq: 5, role: .note, text: "Moved to alex@home.example: alex@work.example hit its 5-hour limit, back at 11:30 am.", at: ago(7)),
+            PhoneMessage(seq: 6, role: .user, text: "Your last login hit its usage limit partway through that turn, so this thread has moved to another one. Carry on from where you left off.", origin: "runner", turn: "cccc3333", at: ago(7)),
+            PhoneMessage(seq: 7, role: .tool, text: "Push main", toolKind: "command", turn: "cccc3333", at: ago(6)),
+            PhoneMessage(seq: 8, role: .assistant, text: "The fix is on main now.\n\n- **What changed:** a failed action shows in the bar over the thread, which has Dismiss.\n- **Checks:** they passed in 267 s.", turn: "cccc3333", at: ago(5)),
         ]
         return (thread, messages)
     }
@@ -403,10 +429,10 @@ public final class FakeBackend: Backend, @unchecked Sendable {
         }
     }
 
-    public func search(_ text: String) async throws -> [PhoneThread] {
+    public func search(_ text: String, everywhere: Bool) async throws -> [PhoneThread] {
         let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return lock.withLock { Array(threadsById.values) }
-            .filter { $0.archivedAt != nil && ThreadSearch.matches($0, query) }
+            .filter { (everywhere || $0.archivedAt != nil) && ThreadSearch.matches($0, query) }
             .sorted { $0.lastActivityAt > $1.lastActivityAt }
     }
 
@@ -453,7 +479,7 @@ public final class FakeBackend: Backend, @unchecked Sendable {
         }
     }
 
-    public func olderMessages(_ threadId: String, beforeSeq: Int, limit: Int) async throws -> MessagePage {
+    public func olderMessages(_ threadId: String, beforeSeq: Int, limit: Int, notes: Bool) async throws -> MessagePage {
         // As over the network, for the long thread.
         if threadId == "long" { try await Task.sleep(for: .milliseconds(700)) }
         let before = lock.withLock { (messagesById[threadId] ?? []).filter { $0.seq < beforeSeq } }
@@ -463,7 +489,11 @@ public final class FakeBackend: Backend, @unchecked Sendable {
         return MessagePage(messages: page, hasMore: before.count > limit, images: images)
     }
 
-    public func messages(_ threadId: String, limit: Int) -> AsyncThrowingStream<MessagePage, Error> {
+    public func images(_ threadId: String, from: Int) -> AsyncThrowingStream<[MessageImage], Error> {
+        watch { [unowned self] in lock.withLock { (imagesById[threadId] ?? []).filter { $0.seq >= from } } }
+    }
+
+    public func messages(_ threadId: String, limit: Int, notes: Bool) -> AsyncThrowingStream<MessagePage, Error> {
         let page = watch { [unowned self] in
             let all = lock.withLock { messagesById[threadId] ?? [] }
             let images = lock.withLock { imagesById[threadId] ?? [] }
@@ -608,6 +638,15 @@ public final class FakeBackend: Backend, @unchecked Sendable {
             s.messagesById[threadId] = list
         }
         return newCommand(threadId: started)
+    }
+
+    /// Stops the turn as a runner would: the thread goes idle, its working line gone.
+    public func interrupt(threadId: String) async throws -> String {
+        mutate { s in
+            s.threadsById[threadId]?.status = .idle
+            s.threadsById[threadId]?.working = nil
+        }
+        return newCommand()
     }
 
     /// A Claude thread's list, as a runner would send it, for the palette
@@ -837,7 +876,9 @@ public final class FakeBackend: Backend, @unchecked Sendable {
                         asksSeq: 126),
             PhoneThread(threadId: "a4", title: "Tidy up old feature flags", cwd: "~/code/api",
                         preview: "Removed six flags nothing reads any more.", lastActivityAt: ago(190),
-                        next: ["Remove the flag helpers too"]),
+                        next: ["Remove the flag helpers too"],
+                        looseEnds: [PhoneLooseEnd(kind: "uncommitted", text: "2 files it changed in api aren't committed"),
+                                    PhoneLooseEnd(kind: "thread", text: "\"Search box for the docs\", a thread it started, is still working", threadId: "a5")]),
             PhoneThread(threadId: "a5", title: "Search box for the docs", cwd: "~/code/website", status: .running,
                         preview: "Adding the index.", lastActivityAt: ago(1), projects: site,
                         working: "Running npm test"),

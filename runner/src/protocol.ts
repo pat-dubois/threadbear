@@ -4,8 +4,25 @@
 
 export const PROTOCOL_VERSION = 1;
 
-export type Provider = 'claude' | 'codex';
-export const PROVIDERS: readonly Provider[] = ['claude', 'codex'];
+// cursor, opencode and grok run over ACP (adapters/acp/); each turns up as a
+// login only where its CLI is installed and logged in (adapters/acp/agents.ts).
+export type Provider = 'claude' | 'codex' | 'cursor' | 'opencode' | 'grok';
+export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'cursor', 'opencode', 'grok'];
+
+// What a provider is called and can do (providers.ts holds the table). `id`
+// is a plain string as a client can be sent one it has never heard of.
+export type ProviderInfo = {
+  id: string;
+  name: string;
+  cliName: string;
+  loginCommand: string;
+  effort: 'claude' | 'codex' | 'none';
+  autoMode: 'classifier' | 'asks';
+  sandbox: boolean;
+  rewind: boolean;
+  smallJobs: boolean;
+  usageReadings: boolean;
+};
 
 export function isProvider(v: unknown): v is Provider {
   return typeof v === 'string' && (PROVIDERS as readonly string[]).includes(v);
@@ -122,6 +139,9 @@ export type CliStatus = {
   policy: CliPolicy;
   inUse: { version: string; threadIds: string[] }[];
   previousVersion?: string; // Codex: the kept version "Go back" returns to
+  // An agent with no version feed to compare against: its row offers an
+  // update on demand (ACP agents).
+  canUpdateNow?: boolean;
   checkedAt?: string;
   hold?: { version: string; reason: string; missing?: string[] };
   update?: {
@@ -161,6 +181,9 @@ export type RunnerDefaults = {
   model?: string;
   models?: Partial<Record<Provider, string>>;
   efforts?: Partial<Record<Provider, EffortLevel>>;
+  // The mode a threads.create with none starts on (runner.json's
+  // defaults.permissionMode). Absent: full.
+  permissionMode?: Exclude<PermissionMode, 'plan'>;
 };
 
 export type ThreadStatus = 'idle' | 'starting' | 'running' | 'waiting' | 'error' | 'stopped';
@@ -170,6 +193,20 @@ export type ArchivedBy = 'mike' | 'agent' | 'threadbear';
 export type ArchiveVerdict = 'worked' | 'didntWork' | 'notNeeded';
 export const ARCHIVE_VERDICTS: readonly ArchiveVerdict[] = ['worked', 'didntWork', 'notNeeded'];
 
+// What fills a thread's context, in Claude's own words (threads.contextUsage,
+// docs/protocol.md "Context breakdown"). Rows are the CLI's /context rows:
+// `id` names a row (absent from a CLI that predates it, and a later CLI may
+// add ids), `kind` says whether it counts: 'used' is in the window, 'buffer'
+// the autocompact reserve, 'free' the rest, 'deferred' tool schemas kept out
+// of the window until loaded.
+export type ContextUsage = {
+  at: string; // when Claude answered
+  model?: string;
+  totalTokens: number; // in the window now
+  maxTokens: number; // the window it's measured against
+  categories: { id?: string; name: string; tokens: number; kind: string }[];
+};
+
 export type ThreadSummary = {
   id: string;
   title: string;
@@ -177,6 +214,9 @@ export type ThreadSummary = {
   accountId: string;
   poolId?: string; // absent: pinned to accountId
   waitingForRoom?: WaitingForRoom;
+  // Off: a turn that hits its login's limit doesn't wait for room and
+  // carry on by itself (Mike turned it off on the limit box). Absent: on.
+  carryOnAtReset?: false;
   // Its last turn couldn't reach the API; it carries on by itself once
   // the runner reaches it again (Runner.onNetworkLost).
   waitingForNetwork?: { since: string };
@@ -246,9 +286,15 @@ export type ThreadSummary = {
   // Who started it, when that wasn't Mike (docs/protocol.md, "Who started
   // a thread"). Absent for his own threads.
   startedBy?: ThreadStartedBy;
+  // Started by another thread but kept out from under it in the sidebar
+  // (docs/protocol.md, "Nested threads").
+  detached?: true;
   // Mike's last message to it, one line, for the sidebar's "You: ..."
   // (docs/protocol.md, "What Mike last asked"). Absent until he's sent one.
   asked?: string;
+  // The librarian's search words for it, space-separated (docs/protocol.md,
+  // "Search"): searches match them as well as the title and preview.
+  keywords?: string;
   // A panel the agent asked to show Mike (show_panel), waiting for him to
   // look at the thread (docs/protocol.md, "Showing panels").
   panelRequest?: PanelRequest;
@@ -256,6 +302,9 @@ export type ThreadSummary = {
   // (docs/protocol.md, "Sharing"). Absent until it's first shared; "off"
   // keeps the link for when it's shared again.
   share?: ThreadShare;
+  // Moving to another runner (docs/protocol.md, "Moving a thread to another
+  // runner"): while it goes, and for a minute after it fails, with why.
+  moving?: { moveId: string; to: string; toName: string; state: string; note?: string };
   sample?: true; // one of the tour's sample threads (threads.samples): made up, never sent to
   // What's still open on the done card of its last turn (experiment
   // looseEnds; docs/protocol.md, "Loose ends"): seq is that card's
@@ -267,9 +316,11 @@ export type ThreadSummary = {
 
 // unlanded: commits on its branch that main lacks. uncommitted: files in
 // its worktree. thread: one it started, still working or waiting on Mike.
-// scheduled: a schedule that will message it again (at: when), which
-// doesn't stop an archive. Clients show any other kind as its text.
-export type LooseEndKind = 'unlanded' | 'uncommitted' | 'thread' | 'scheduled';
+// unmerged: work it pushed to a branch (an open PR) that isn't on the
+// remote's default branch. scheduled: a schedule that will message it
+// again (at: when), which doesn't stop an archive. Clients show any other
+// kind as its text.
+export type LooseEndKind = 'unlanded' | 'uncommitted' | 'unpushed' | 'unmerged' | 'thread' | 'running' | 'scheduled';
 export type LooseEnd = { kind: LooseEndKind; text: string; threadId?: string; at?: string };
 
 export type ShareAccess = 'off' | 'link';
@@ -291,6 +342,9 @@ export type PanelRequest = {
   // pin with show: the highlight to open in the pane, over Highlights. An
   // app that doesn't know this opens Highlights.
   highlight?: string;
+  // A web panel's page is loaded afresh as it's shown (show_panel's reload).
+  // An app that doesn't know this just shows it.
+  reload?: true;
   at: string;
 };
 
@@ -347,6 +401,9 @@ export type Project = {
   // the board as last read (see "Project tasks").
   notion?: string;
   tasks?: ProjectTasks;
+  // The project it's a part of (docs/protocol.md, Projects, "Parts"). One
+  // level: a part has no parts.
+  parentId?: string;
   threadCount: number;
   lastActivityAt?: string;
 };
@@ -417,6 +474,10 @@ export type LibrarianEntry = {
   outcome: LibrarianOutcome;
   text: string;
   projectIds?: string[];
+  // Why it joined each project, by id, and the look's line overall. Only on
+  // a look that filed the thread somewhere.
+  reasons?: Record<string, string>;
+  why?: string;
   costUsd?: number;
 };
 
@@ -444,6 +505,8 @@ export type Subagent = {
   parentId?: string; // the sub-agent that started this one
   description: string;
   agentType?: string;
+  model?: string; // the model it runs on, from its own messages: "claude-opus-5-5"
+  effort?: string; // its effort level, once its transcript has been read
   status: SubagentStatus;
   background: boolean;
   activity?: string; // while running: what it's doing now
@@ -510,6 +573,11 @@ export type PatchInfo = {
   error?: string; // set when the file couldn't be loaded; it then gives nothing
   matched?: string[]; // a tool patch (appliesTo): the paths that made it apply
   liveError?: string; // a when or badge function that threw or took too long
+  // A patch that loads without a hash (home's) runs something Threadbear
+  // can't follow, so threads that ask first ask before every file edit:
+  // what, where, and what to change (docs/protocol.md, "Agent writes that
+  // run as code").
+  editsAsk?: string;
   // A project's patch file that isn't trusted yet, so wasn't loaded and
   // gives nothing (docs/protocol.md, "Trusting a folder's patches"): "new"
   // when nothing from its folder is trusted, "changed" when an earlier
@@ -630,6 +698,28 @@ export type TurnOutcome = 'completed' | 'interrupted' | 'failed';
 // connection), so the runner carries the turn on once it's back.
 export type TurnErrorKind = 'usageLimit' | 'contextWindow' | 'auth' | 'network';
 
+// Review by another lab's ledger (runner/lab-review.ts). Each finding has
+// an id that stays the same across rounds; outcome is the reviewed
+// agent's answer (end_turn's findings), absent until it gives one.
+export type ReviewSeverity = 'high' | 'medium' | 'low';
+export type ReviewOutcome = 'fixed' | 'disputed' | 'left';
+export type ReviewFinding = { id: number; round: number; severity: ReviewSeverity; claim: string; where?: string; case?: string; outcome?: ReviewOutcome; note?: string };
+export type LabReviewLedger = {
+  reviewer: string; // "Codex (codex-1)"
+  independent: boolean; // another lab, not a fresh session of the same one
+  rounds: number;
+  threadId: string; // the latest round's review thread
+  // The latest round found nothing that holds up.
+  passed: boolean;
+  // A round whose reviewer gave no verdict in end_turn: its reply is all
+  // there is, so it has no findings here.
+  unstructured?: true;
+  // Fixes made since the latest round that no review has looked at: the
+  // rounds ran out.
+  unchecked?: true;
+  findings: ReviewFinding[];
+};
+
 // turn.completed's `usage`, per provider.
 export type ClaudeTurnUsage = { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number };
 export type CodexTurnUsage = {
@@ -654,7 +744,7 @@ export type DesignReview = {
   id: string;
   title: string;
   note?: string;
-  // The option id the agent would pick, marked "my pick" in the window.
+  // The option id the agent would pick, marked with a star and "Recommended" in the window.
   recommended?: string;
   // image is the option's first shot, kept for clients that only show one.
   // shots, when given, is every shot in order, image included. url: the
@@ -731,6 +821,8 @@ export type EventBody =
       title: string;
       input: Record<string, unknown>;
       options: ApprovalOption[];
+      // Why it's asking (Auto's safety check, a rule, a hook), when the CLI says.
+      reason?: string;
     }
   // The agent's other calls from the same reply, waiting behind this card
   // (docs/protocol.md, "Queued calls"). A later one replaces the list.
@@ -760,13 +852,21 @@ export type EventBody =
       // With needs "nothing": end_turn's suggested follow-ups.
       next?: string[];
       needsFrom?: 'tool' | 'text';
+      // Review by another lab: what the reviewer found so far and what the
+      // agent did about each, on the turn that answered them
+      // (runner/lab-review.ts; docs/protocol.md, "Review by another lab").
+      review?: LabReviewLedger;
     }
   // The ticks on a card of asks, the whole set each time. Outside any turn.
   | { type: 'asks.ticked'; asksSeq: number; ticked: number[] }
   // wake: a background task's notification that went into the running
   // turn, which opens a turn that's had its end_turn again (needs.ts,
   // takenEndTurn).
-  | { type: 'system.note'; text: string; wake?: true }
+  // login: the thread's login ran out and it moved, is waiting for room,
+  // or was told not to wait (runner/pools.ts). The only notes the backend
+  // gets (sync.ts toMessageDoc), so another Mac can say a thread changed
+  // login by itself.
+  | { type: 'system.note'; text: string; wake?: true; login?: true; savedMessage?: true; supersededReminder?: string }
   | { type: 'error'; message: string }
   // A command action that ran (patches.ts): its output, truncated like a
   // tool result. Outside any turn.
@@ -781,7 +881,7 @@ export type EventBody =
       text: string;
       truncated: boolean;
       durationMs: number;
-      trigger?: HookTrigger | 'worktree.setup'; // set when a hook or a new worktree's setup ran it, absent for a chip or tb run
+      trigger?: HookTrigger | 'worktree.setup' | 'worktree.teardown'; // set when a hook, a new worktree's setup or an archived one's teardown ran it, absent for a chip or tb run
     }
   // Mike edited the message at fromSeq (docs/protocol.md, "Editing a
   // message"): fromSeq..toSeq are gone from the conversation. Outside any turn.
@@ -874,8 +974,14 @@ export type Schedule = {
   model?: string;
   effort?: EffortLevel;
   permissionMode?: PermissionMode;
+  // Set by the runner when there's no permissionMode: the mode its runs start
+  // with, this runner's default (runner.json's defaults.permissionMode, else
+  // full). Absent for another runner's schedule, whose default isn't known
+  // here. Raising a schedule's mode is checked against it (threadbear-mcp.ts,
+  // scheduleModes); never stored.
+  defaultMode?: PermissionMode;
   // A shell command run first, in its folder; a run whose check prints
-  // nothing is skipped (experiment scheduleChecks, schedule-check.ts).
+  // nothing is skipped (schedule-check.ts).
   check?: string;
   // How long the check may take, in seconds (at most 300); absent, 60.
   checkTimeoutSecs?: number;
@@ -923,9 +1029,11 @@ export const ErrorCode = {
   accountNotFound: -32010,
   busy: -32020,
   moved: -32030, // a draining runner has handed the thread over (Handovers)
+  notShownThere: -32031, // threads.send or threads.edit with a runnerId the thread isn't on
   convexSignedOut: -32040, // the runner's Convex CLI isn't signed in ("The Convex panel")
   convexNoAccess: -32041, // its Convex login can't reach the deployment
   backgroundRunning: -32050, // threads.edit without stopBackground while background work runs
+  notAllowed: -32060, // the calling thread doesn't have the access for this (A thread's own key)
   other: -32000,
 } as const;
 

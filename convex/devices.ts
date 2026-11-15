@@ -4,7 +4,7 @@ import { v } from 'convex/values';
 import { internalMutation, internalQuery } from './_generated/server';
 import { hasLiveToken } from './pushTargets';
 import { runnerName } from './sync';
-import { hasLiveKey } from './lib';
+import { hasLiveKey, PRESENCE_FRESH_MS } from './lib';
 import { nextHealth } from './pushHealth';
 
 // Only phones whose token is still good (pushTargets.ts): revoking deletes
@@ -12,14 +12,14 @@ import { nextHealth } from './pushHealth';
 // with no tokenId (from before 5 Nov 2026), is skipped here.
 export const targets = internalQuery({
   args: {},
-  returns: v.array(v.object({ apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), notify: v.union(v.literal('away'), v.literal('always'), v.literal('off')), pushKey: v.optional(v.string()) })),
+  returns: v.array(v.object({ apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), notify: v.union(v.literal('away'), v.literal('always'), v.literal('off')), pushKey: v.optional(v.string()), platform: v.optional(v.literal('android')) })),
   handler: async (ctx) => {
     const now = Date.now();
     const tokens = await ctx.db.query('tokens').collect();
     const out = [];
     for await (const d of ctx.db.query('devices')) {
       if (!hasLiveToken(d, tokens, now)) continue;
-      out.push({ apnsToken: d.apnsToken, environment: d.environment, notify: d.notify ?? ('away' as const), ...(d.pushKey ? { pushKey: d.pushKey } : {}) });
+      out.push({ apnsToken: d.apnsToken, environment: d.environment, notify: d.notify ?? ('away' as const), ...(d.pushKey ? { pushKey: d.pushKey } : {}), ...(d.platform ? { platform: d.platform } : {}) });
     }
     return out;
   },
@@ -133,10 +133,6 @@ export const holdPush = internalMutation({
   },
 });
 
-// A runner's word that Mike is at its Mac counts while it's still checking
-// in; a Mac that's asleep or offline counts as away.
-const PRESENCE_FRESH_MS = 3 * 60_000;
-
 // Apple said the token is gone (the app was removed, or it's stale).
 export const drop = internalMutation({
   args: { apnsToken: v.string() },
@@ -176,10 +172,10 @@ export const threadForPush = internalQuery({
 
 export const list = internalQuery({
   args: {},
-  returns: v.array(v.object({ environment: v.string(), tokenName: v.string(), updatedAt: v.string(), tokenTail: v.string(), notify: v.string() })),
+  returns: v.array(v.object({ platform: v.string(), environment: v.string(), tokenName: v.string(), updatedAt: v.string(), tokenTail: v.string(), notify: v.string() })),
   handler: async (ctx) => {
     const out = [];
-    for await (const d of ctx.db.query('devices')) out.push({ environment: d.environment, tokenName: d.tokenName, updatedAt: new Date(d.updatedAt).toISOString(), tokenTail: d.apnsToken.slice(-6), notify: d.notify ?? 'away' });
+    for await (const d of ctx.db.query('devices')) out.push({ platform: d.platform ?? 'apple', environment: d.environment, tokenName: d.tokenName, updatedAt: new Date(d.updatedAt).toISOString(), tokenTail: d.apnsToken.slice(-6), notify: d.notify ?? 'away' });
     return out;
   },
 });

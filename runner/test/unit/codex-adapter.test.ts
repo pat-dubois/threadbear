@@ -487,7 +487,7 @@ test('interrupt while the turn is still held behind start drops it and its follo
   h.session.send({ id: 'm1', text: 'one', images: [] });
   h.session.send({ id: 'm2', text: 'two', images: [] });
   await h.session.interrupt();
-  assert.deepEqual(h.rec.results(), [{ outcome: 'interrupted', durationMs: 0, answers: 'm1', answered: ['m1', 'm2'], queuedTurns: 0 }]);
+  assert.deepEqual(h.rec.results(), [{ outcome: 'interrupted', durationMs: 0, answers: 'm1', answered: ['m1', 'm2'], unreceived: ['m1', 'm2'], queuedTurns: 0 }]);
   await started(h);
   await sleep(50);
   assert.equal(h.conn.sent('turn/start').length, 0, 'Stop means stop');
@@ -509,7 +509,7 @@ test('interrupt before the turn id is known waits for it, then interrupts that t
   h.conn.respond(intr.id, {});
   complete(h, 'u1', 'interrupted');
   await waitFor(() => h.rec.results().length === 1);
-  assert.deepEqual(h.rec.results()[0], { outcome: 'interrupted', durationMs: 1200, answers: 'm1', answered: ['m1', 'm2'], queuedTurns: 0 });
+  assert.deepEqual(h.rec.results()[0], { outcome: 'interrupted', durationMs: 1200, answers: 'm1', answered: ['m1', 'm2'], unreceived: ['m2'], queuedTurns: 0 });
   assert.equal(h.conn.sent('turn/steer').length, 0, 'the dropped message was never steered');
   await h.session.end();
 });
@@ -670,8 +670,12 @@ test('subagents: traffic is marked with the child id, approvals reach this sink 
   h.conn.notify('item/started', { threadId: 'th-1', turnId: 'u1', item: { type: 'subAgentActivity', id: 'sa-1', kind: 'started', agentThreadId: 'child-1', agentPath: '/root/image_color' } });
   h.conn.notify('turn/started', { threadId: 'child-1', turn: { id: 'cu1', rootTurnId: 'u1', status: 'inProgress' } });
   h.conn.notify('item/started', { threadId: 'child-1', turnId: 'cu1', item: { type: 'imageView', id: 'exec-v', path: '/w/swatch.png' } });
-  h.conn.notify('item/completed', { threadId: 'child-1', turnId: 'cu1', item: { type: 'imageView', id: 'exec-v', path: '/w/swatch.png' } });
+  // The completion goes once the start is through, and the test waits for
+  // it too: seeing the start's item doesn't mean the completion has reached
+  // the normalizer, and on a loaded run it hadn't (emilsbauga's fork, 8 Nov).
   await waitFor(() => h.rec.itemIds().includes('child-1/exec-v'));
+  h.conn.notify('item/completed', { threadId: 'child-1', turnId: 'cu1', item: { type: 'imageView', id: 'exec-v', path: '/w/swatch.png' } });
+  await waitFor(() => h.norm.calls.some((c) => c.method === 'item/completed' && c.from?.childThreadId === 'child-1'));
   const childCalls = h.norm.calls.filter((c) => c.from);
   assert.deepEqual(childCalls.map((c) => [c.method, c.from!.childThreadId]), [['turn/started', 'child-1'], ['item/started', 'child-1'], ['item/completed', 'child-1']]);
   assert.equal(h.rec.kinds().includes('cliTurn'), false, "a child's turn is never a cliTurn");
@@ -979,7 +983,7 @@ test('in ask mode every threadbear tool that changes something asks first; read-
   assert.equal(ok(await call('list_threads')), true);
   assert.equal(ok(await call('read_thread')), true);
   assert.equal(h.rec.approvals.length, 0);
-  // An ask-mode thread can't give itself full access without Mike.
+  // An ask-mode thread can't give itself full access without Alex.
   h.rec.state.approve = async () => ({ decision: 'deny' });
   assert.equal(ok(await call('update_thread', { permissionMode: 'full' })), false);
   assert.equal(h.rec.approvals.at(-1)!.name, 'mcp__threadbear__update_thread');
@@ -1131,9 +1135,9 @@ test('/<skill> adds the skill to the turn; other commands and paths go as words'
   ]);
   complete(h, 'u1');
   await waitFor(() => h.rec.results().length === 1);
-  h.session.send({ id: 'm2', text: '/Users/mike/x.md looks off', images: [] });
+  h.session.send({ id: 'm2', text: '/Users/alex/x.md looks off', images: [] });
   const words = await h.conn.request('turn/start');
-  assert.deepEqual(words.params.input, [{ type: 'text', text: '/Users/mike/x.md looks off', text_elements: [] }]);
+  assert.deepEqual(words.params.input, [{ type: 'text', text: '/Users/alex/x.md looks off', text_elements: [] }]);
   await h.session.end();
 });
 

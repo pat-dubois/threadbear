@@ -41,6 +41,8 @@ extension AppModel {
                 clis = hello.clis
                 clisSupported = hello.clis.isEmpty ? nil : true
                 runnerUpdates = hello.updates
+                experiments = hello.experiments
+                Providers.update(hello.providers)
                 // An older runner sends no pools; the app then works as it
                 // did before them.
                 pools = hello.pools ?? []
@@ -63,8 +65,21 @@ extension AppModel {
                 var fresh: [String: ThreadSummary] = [:]
                 for thread in list { fresh[thread.id] = thread }
                 // Other runners' threads aren't this runner's to list.
-                for (id, thread) in threads where thread.isRemote && fresh[id] == nil { fresh[id] = thread }
+                // Nor are threads still on their way here or there (movedAway):
+                // only this list or the destination's row says they've arrived.
+                for (id, thread) in threads where (thread.isRemote || madeRemote.contains(id)) && fresh[id] == nil { fresh[id] = thread }
+                // Everything this list has is this Mac's, one that came here
+                // from another runner too (a move done while the app was away,
+                // or before its old runner let it go): `arrivedHere` stops
+                // didSet keeping the old runner's id on it.
+                let arrived = Set(list.map(\.id))
+                madeRemote.subtract(arrived)
+                arrivedHere = arrived
                 threads = fresh
+                arrivedHere = []
+                // A thread deleted while the app wasn't connected never
+                // reached forget(), so its Terminal shell would run on.
+                Terminals.shared.stopAll(except: list.map(\.id))
                 threadsLoaded = true
                 onThreadsLoaded?()
                 threadCountMayHaveChanged()
@@ -76,11 +91,10 @@ extension AppModel {
                 loadConnectors()
                 loadSettings()
                 loadStandingInstructions()
-                // Other runners' threads come back with their own connection.
-                for session in sessions.values where session.state == .loaded && !viaDirectLink(session.threadId) {
+                for session in sessions.values where session.state == .loaded {
                     await session.subscribe()
                 }
-                for session in sessions.values where session.state != .loaded && !viaDirectLink(session.threadId) {
+                for session in sessions.values where session.state != .loaded {
                     session.open(width: transcript.width > 0 ? transcript.width : transcript.currentTableWidth)
                 }
                 if let ref = subagentSelection {
@@ -93,7 +107,7 @@ extension AppModel {
                 // new client; only the loop that owns the client clears it.
                 guard self.client === client else { return }
                 self.client = nil
-                for session in sessions.values where !viaDirectLink(session.threadId) { session.connectionLost() }
+                for session in sessions.values { session.connectionLost() }
                 connection = .lost
                 updateRestart { $0.disconnected(now: Date()) }
                 AppLog.write("connection", "lost the connection to the runner")
@@ -127,18 +141,15 @@ extension AppModel {
         for await notification in client.notifications {
             switch notification {
             case .threadUpdated(let thread):
-                // Another runner's thread from this Mac's runner is the
-                // relay's (a share changing there), a summary from the
-                // sidebar's table: on the direct link its own runner's
-                // fuller one is what counts, card and seqs and all.
-                if directRemoteLink, threads[thread.id]?.isRemote == true { break }
                 receive(thread)
             case .threadEvent(let threadId, let event):
                 sessions[threadId]?.receive(event)
                 if case .reviewUpdated(let review) = event.payload { receiveReview(review, threadId: threadId) }
                 if case .buttonUpdated(let button) = event.payload { ReplyButtons.shared.receive(button, threadId: threadId) }
             case .threadDeleted(let threadId):
-                forget(threadId)
+                // A thread moving away stays as it is until where it's going
+                // lists it, which that runner's row may already have done.
+                if movedAway(threadId) { applyRemoteIndex() } else { forget(threadId) }
             case .accountsUpdated(let list):
                 // The runner learned something (its model lists, a
                 // default it saw a turn run on, new usage): replaces
@@ -194,13 +205,6 @@ extension AppModel {
         connection = .connected
     }
 
-    /// And other runners' connections over fake ones.
-    func useRemoteClientsForTesting(_ clients: RemoteClients) {
-        remoteClients.closeAll()
-        remoteClients = clients
-        wireRemoteClients()
-    }
-
     /// Tests feed it what the runner would: a notice, a status, a drop.
     func noticeForTesting(level: String = "info", _ message: String) { notice(level: level, message) }
     func receiveForTesting(_ thread: ThreadSummary) { receive(thread) }
@@ -250,8 +254,20 @@ extension AppModel {
         apply(thread)
     }
 
-    private func apply(_ thread: ThreadSummary) {
-        let previous = threads[thread.id]
+    private func apply(_ incoming: ThreadSummary) {
+        let previous = threads[incoming.id]
+        var incoming = incoming
+        let movingHere = previous?.isRemote == true && previous?.moving.map { !$0.ended && $0.to == runners.first(where: \.isSelf)?.id } == true
+        if madeRemote.contains(incoming.id) || movingHere {
+            // Waiting on its move: no summary says where it is (a relayed one
+            // and this Mac's own look the same here), so it stays locked with
+            // its move, and a move here is only taken as arrived from this
+            // Mac's own list (Daybreak 113), whether or not its old runner
+            // has let it go yet.
+            if incoming.moving == nil { incoming.moving = previous?.moving }
+            if movingHere { confirmArrival(incoming.id) }
+        }
+        let thread = keepingAskedMove(incoming, over: previous)
         threads[thread.id] = thread
         threadCountMayHaveChanged()
         // The open transcript's "3 sub-agents working in the background"
@@ -291,7 +307,9 @@ extension AppModel {
         let panel = WindowDock.threadPanel(threadId)
         if dock.layout.contains(panel) { dock.close(panel) }
         threads[threadId] = nil
+        Terminals.shared.stop(threadId: threadId)
         drafts[threadId] = nil
+        contextUsage[threadId] = nil
         if let session = sessions.removeValue(forKey: threadId) { session.unsubscribe() }
         if selection == threadId { selection = nil }
         if subagentSelection?.threadId == threadId { subagentSelection = nil }

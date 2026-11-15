@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeHarness, tick, tmpDir } from '../helpers/fakes.ts';
+import { FakeAccounts, makeHarness, tick, tmpDir, withCodex } from '../helpers/fakes.ts';
 import { checkSequence, checkSummary } from '../helpers/protocol-check.ts';
 import { makePng } from '../helpers/png.ts';
 import { RpcError } from '../../src/protocol.ts';
@@ -142,18 +142,18 @@ test('idle release after 30 minutes, then the next send resumes the session', as
   assert.equal(h.runner.get(thread.id).costUsd, 0.005);
 });
 
-test('a message from the phone tells the agent so, and where Mike is; the transcript keeps what he typed', async () => {
+test('a message from the phone tells the agent so, and where Alex is; the transcript keeps what he typed', async () => {
   let atMac: boolean | undefined;
   const h = makeHarness(undefined, {}, { atMac: () => atMac });
   const { thread, turnId } = create(h, { origin: 'phone' });
   const s = h.adapter.last;
   // Presence not checked yet: just where it came from.
-  assert.deepEqual(s.sent, [{ id: turnId, text: '[Sent from the iPhone app]\nFix the tests\nmore detail here', images: [] }]);
+  assert.deepEqual(s.sent, [{ id: turnId, text: '[Sent from the phone app]\nFix the tests\nmore detail here', images: [] }]);
   s.init();
   // Steered into the running turn, while he's away.
   atMac = false;
   h.runner.send(thread.id, 'on the bus', [], { origin: 'phone' });
-  assert.equal(s.sent[1].text, '[Sent from the iPhone app, away from the Mac]\non the bus');
+  assert.equal(s.sent[1].text, '[Sent from the phone app, away from the Mac]\non the bus');
   // Typed at the Mac: nothing added.
   h.runner.send(thread.id, 'back at my desk');
   assert.equal(s.sent[2].text, 'back at my desk');
@@ -163,7 +163,7 @@ test('a message from the phone tells the agent so, and where Mike is; the transc
   atMac = true;
   h.runner.send(thread.id, 'from the couch', [], { origin: 'phone' });
   await tick();
-  assert.equal(h.adapter.last.sent.at(-1)?.text, '[Sent from the iPhone app, at the Mac]\nfrom the couch');
+  assert.equal(h.adapter.last.sent.at(-1)?.text, '[Sent from the phone app, at the Mac]\nfrom the couch');
   const typed = h.events(thread.id).filter((e) => e.type === 'user.message').map((e) => e.text);
   assert.deepEqual(typed, ['Fix the tests\nmore detail here', 'on the bus', 'back at my desk', 'from the couch']);
 });
@@ -402,11 +402,26 @@ test('calls queued on a card: listed by approval.queued, grown, and answered in 
   assert.deepEqual(h.events(thread.id).filter((e) => e.type === 'approval.queued').at(-1).calls.map((c: { itemId: string }) => c.itemId), ['w1', 'b1']);
   h.runner.respondApproval({ threadId: thread.id, approvalId: req.approvalId, decision: 'deny', queued: { w1: 'allow', b1: 'deny', x9: 'allow' } });
   assert.deepEqual(await answer, { decision: 'deny', message: undefined, queued: { w1: 'allow', b1: 'deny' } });
-  // From the phone, which never saw the list, only the card's own call counts.
-  const again = s.sink.requestApproval({ toolUseId: 'e2', name: 'Edit', title: 'Edit a.txt', input: {}, canAlwaysAllow: true, signal: new AbortController().signal, queued: [w1] });
+  // From the phone, which never saw the list, only the card's own call
+  // counts. (A command: an edit can't be allowed from the phone at all.)
+  const again = s.sink.requestApproval({ toolUseId: 'e2', name: 'Bash', title: 'npm test', input: { command: 'npm test' }, canAlwaysAllow: true, signal: new AbortController().signal, queued: [w1] });
   const req2 = h.events(thread.id).filter((e) => e.type === 'approval.requested').at(-1);
   h.runner.respondApproval({ threadId: thread.id, approvalId: req2.approvalId, decision: 'allow', queued: { w1: 'allow' }, remote: true });
   assert.deepEqual(await again, { decision: 'allow', message: undefined });
+});
+
+// Mike, 10 Nov 2026: the phone shows only an edit's path, and Allow writes
+// all of it, so an edit is allowed only in the Mac app.
+test("an edit can't be allowed from the phone, website or another Mac, only denied", async () => {
+  const h = makeHarness();
+  const { thread } = create(h, { permissionMode: 'ask' });
+  const s = h.adapter.last;
+  s.init();
+  const answer = s.sink.requestApproval({ toolUseId: 'w9', name: 'Write', title: 'Write build.sh', input: { file_path: '/tmp/build.sh', content: '# fine\nrm -rf ~\n' }, canAlwaysAllow: true, signal: new AbortController().signal });
+  const req = h.events(thread.id).filter((e) => e.type === 'approval.requested').at(-1);
+  assert.throws(() => h.runner.respondApproval({ threadId: thread.id, approvalId: req.approvalId, decision: 'allow', remote: true }));
+  h.runner.respondApproval({ threadId: thread.id, approvalId: req.approvalId, decision: 'allow' });
+  assert.equal((await answer).decision, 'allow', 'the Mac app connected straight to the runner can');
 });
 
 test('questions are answered by question text, header or index', async () => {
@@ -485,6 +500,71 @@ test('snooze releases the CLI, hides the thread, and brings it back unread', asy
   const seen = h.runner.markSeen(thread.id, t.lastSeq).thread;
   assert.equal(seen.needsYou, false);
   assert.equal(seen.woke, undefined);
+});
+
+// Archived while hibernating, it woke in the archive anyway: a "Woke up"
+// and an unread mark there, and any message it had queued started while it
+// was still archived (13 Nov 2026, the implicit state machines scan). Its
+// hibernation now just ends there, quietly, so brought back it's in the
+// inbox, as it would have been.
+test('a hibernating thread that is archived stays quiet in the archive, and is in the inbox when brought back after its time', () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  h.adapter.last.init();
+  h.adapter.last.result();
+  h.runner.markSeen(thread.id, 99);
+  h.runner.update({ threadId: thread.id, snoozedUntil: new Date(h.clock.now() + 60 * MIN).toISOString() });
+  h.runner.update({ threadId: thread.id, archived: true });
+  h.clock.advance(2 * 60 * MIN);
+  const t = h.runner.get(thread.id);
+  assert.equal(t.woke, undefined);
+  assert.equal(t.needsYou, false);
+  assert.ok(!h.events(thread.id).some((e) => e.type === 'system.note' && e.text.startsWith('Woke up')));
+  assert.deepEqual(h.runner.list(['archived']).map((x) => x.id), [thread.id]);
+  assert.equal(h.runner.get(thread.id).snoozedUntil, undefined, 'its hibernation ended');
+  h.runner.update({ threadId: thread.id, archived: false });
+  assert.deepEqual(h.runner.list().map((x) => x.id), [thread.id]);
+  assert.ok(!h.events(thread.id).some((e) => e.type === 'system.note' && e.text.startsWith('Woke up')));
+});
+
+// From Codex's review of that fix: skipping archived threads at start left
+// a hibernation in words that was still being worked out (its answer lost
+// with the old runner) with its year-9999 time for good, so bringing the
+// thread back left it asleep with nothing to wake it.
+test('an archived thread whose hibernation in words was cut short by a restart is in the inbox when brought back', () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  h.adapter.last.init();
+  h.adapter.last.result();
+  h.runner.update({ threadId: thread.id, archived: true });
+  const st = h.runner.threads.get(thread.id)!;
+  st.rec.snoozedUntil = '9999-01-01T00:00:00.000Z';
+  st.rec.wakeWhen = { said: 'when the build is done', pending: true } as never;
+  h.runner.markDirty(st);
+  h.runner.flush?.();
+  const again = h.restart();
+  again.runner.update({ threadId: thread.id, archived: false });
+  assert.deepEqual(again.runner.list().map((x) => x.id), [thread.id]);
+  assert.equal(again.runner.get(thread.id).snoozedUntil, undefined);
+});
+
+// Archived (or snoozed) during a turn with a message queued behind it: the
+// turn ends and the queue is kept for when it comes back, but scheduleIdle
+// returned on the queue before releasing a put-away thread's CLI, so it
+// stayed alive with any background work, and the archive's cleanup never
+// ran (13 Nov 2026, the implicit state machines scan, Codex's review).
+test('a thread archived during a turn with a message queued behind it lets its CLI go', async () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  const s = h.adapter.last;
+  s.init();
+  h.runner.send(thread.id, 'and then this', [], { queue: true });
+  assert.equal(h.runner.threads.get(thread.id)!.rec.queue.length, 1);
+  h.runner.update({ threadId: thread.id, archived: true });
+  if (h.runner.get(thread.id).status === 'running') s.result('interrupted');
+  await tick();
+  assert.equal(s.ended, true, 'its CLI goes');
+  assert.equal(h.runner.threads.get(thread.id)!.rec.queue.length, 1, 'the message waits for it to come back');
 });
 
 test('the wake note counts from when it first went away, even if the time changed', () => {
@@ -568,10 +648,10 @@ test('a dated snooze or a message clears an until-restart snooze', () => {
   assert.throws(() => h.runner.update({ threadId: thread.id, snoozedUntil: 'later' }), /ISO time, "restart" or "release"/);
 });
 
-test('an archive says who did it, and Mike\'s verdict goes in the thread', () => {
+test('an archive says who did it, and Alex\'s verdict goes in the thread', () => {
   const h = makeHarness();
   const { thread } = create(h);
-  // ⌘E or a swipe: Mike, no verdict, no note.
+  // ⌘E or a swipe: Alex, no verdict, no note.
   const plain = h.runner.update({ threadId: thread.id, archived: true }).thread;
   assert.equal(plain.archivedBy, 'mike');
   assert.equal(plain.archiveVerdict, undefined);
@@ -588,7 +668,7 @@ test('an archive says who did it, and Mike\'s verdict goes in the thread', () =>
   assert.equal(h.runner.get(thread.id).archiveVerdict, undefined);
   const byAgent = h.runner.update({ threadId: thread.id, archived: true, archivedBy: 'agent', verdict: 'worked' }).thread;
   assert.equal(byAgent.archivedBy, 'agent');
-  assert.equal(byAgent.archiveVerdict, undefined, "only Mike's verdict counts");
+  assert.equal(byAgent.archiveVerdict, undefined, "only Alex's verdict counts");
 });
 
 test('archive mid-turn interrupts, then releases the CLI; unarchive brings it back', async () => {
@@ -1060,7 +1140,7 @@ test('a background subagent asking for approval with no turn running gets a card
   assert.equal(h.runner.get(thread.id).status, 'idle');
   // The subagent finishes; the CLI's own turn reports it, then ends.
   s.out({ kind: 'cliTurn', note: 'Agent "make a folder" completed' });
-  s.text('m5:0', 'Made the folder.');
+  s.text('laptop:0', 'Made the folder.');
   s.out({ kind: 'result', result: { outcome: 'completed', durationMs: 5, own: true } });
   assert.equal(h.events(thread.id).at(-1).type, 'turn.completed');
   assert.equal(h.runner.get(thread.id).status, 'idle');
@@ -1132,7 +1212,7 @@ test("Stop closes a subagent's card with no turn running, and it's the only thin
   assert.deepEqual(checkSequence(h.events(thread.id)), []);
 });
 
-test("an agent's or the runner's stop isn't told to the agent as Mike's", async () => {
+test("an agent's or the runner's stop isn't told to the agent as Alex's", async () => {
   const h = makeHarness();
   const { thread } = create(h, { permissionMode: 'ask' });
   const s = h.adapter.last;
@@ -1298,7 +1378,7 @@ test('a turn background work woke says what finished, sub-agents and shells alik
   s.out({ kind: 'cliTurn', note: 'Agent "Mine the repo for stories" completed' });
   let started = h.events(thread.id).filter((e) => e.type === 'turn.started');
   assert.equal(started.length, 2);
-  assert.equal(started[0].wokeBy, undefined, "Mike's own turn wasn't woken");
+  assert.equal(started[0].wokeBy, undefined, "Alex's own turn wasn't woken");
   assert.deepEqual(started[1].wokeBy, [
     { kind: 'agent', description: 'Mine the repo for stories' },
     { kind: 'shell', description: 'npm test' },
@@ -1339,6 +1419,93 @@ test('snoozing a thread with background work stops it straight away and says so'
   assert.match(note.text, /Stopped background work.*npm run dev/);
   await tick();
   assert.equal(h.runner.get(thread.id).live, false);
+});
+
+// Thread 8a971407, 12 Nov 2026: hibernated with its CLI already released,
+// so the snooze's releaseWhenIdle had no CLI to go with and stayed set. It
+// woke on its timer, Mike's next message started a fresh CLI, and the end
+// of that turn hard-released it, killing the sub-agent it had just started.
+test('a hibernation with no CLI live leaves nothing to release the next one for', async () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  const first = h.adapter.last;
+  first.init();
+  first.result();
+  h.clock.advance(30 * MIN);
+  assert.equal(first.ended, true, 'released when idle');
+  await tick();
+  h.runner.update({ threadId: thread.id, snoozedUntil: new Date(h.clock.now() + 60 * MIN).toISOString() });
+  h.clock.advance(60 * MIN);
+  assert.equal(h.runner.get(thread.id).snoozedUntil, undefined, 'woke');
+  h.runner.send(thread.id, 'give the diagram more room');
+  await tick();
+  const s = h.adapter.last;
+  assert.notEqual(s, first);
+  s.init();
+  s.out({ kind: 'tasks', tasks: [{ id: 'a1', type: 'local_agent', kind: 'agent', description: 'Give the viewer more room' }] });
+  s.result();
+  assert.equal(s.ended, false, 'kept for the sub-agent');
+  assert.equal(h.events(thread.id).some((e) => e.type === 'system.note' && /Stopped background work/.test(e.text)), false);
+});
+
+// A change that wants a fresh CLI (here another login, asked for during the
+// turn) waits for background work, rather than stopping it as the turn ends.
+test('a fresh CLI asked for during a turn waits for background work to finish', async () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  const s = h.adapter.last;
+  s.init();
+  s.out({ kind: 'tasks', tasks: [{ id: 'a1', type: 'local_agent', kind: 'agent', description: 'Check the docs' }] });
+  h.runner.update({ threadId: thread.id, accountId: 'claude-main' });
+  s.result();
+  await tick();
+  assert.equal(s.ended, false, 'kept while the sub-agent works');
+  s.out({ kind: 'tasks', tasks: [] });
+  assert.equal(s.ended, false, 'kept for the turn that reads its result');
+  // That turn comes and goes; then the CLI is released for the move.
+  s.out({ kind: 'cliTurn', note: 'Agent "Check the docs" completed' });
+  s.result();
+  await tick();
+  assert.equal(s.ended, true, 'released once it finished');
+  assert.equal(s.endedHard, false);
+});
+
+test('another login picked between turns waits for background work too', async () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  const s = h.adapter.last;
+  s.init();
+  s.out({ kind: 'tasks', tasks: [{ id: 'a1', type: 'local_agent', kind: 'agent', description: 'Check the docs' }] });
+  s.result();
+  h.runner.update({ threadId: thread.id, accountId: 'claude-main' });
+  await tick();
+  assert.equal(s.ended, false, 'kept while the sub-agent works');
+  s.out({ kind: 'tasks', tasks: [] });
+  s.out({ kind: 'cliTurn', note: 'Agent "Check the docs" completed' });
+  s.result();
+  await tick();
+  assert.equal(s.ended, true, 'released once it finished');
+  assert.equal(s.endedHard, false);
+});
+
+// Moved to Codex during the turn: the Claude CLI still live wakes to read
+// its sub-agent's result, though the record now says Codex, which doesn't.
+test('a move to another provider keeps the old CLI for the turn that reads its result', async () => {
+  const h = makeHarness(undefined, {}, { accounts: new FakeAccounts(withCodex()) });
+  const { thread } = create(h);
+  const s = h.adapter.last;
+  s.init();
+  s.out({ kind: 'tasks', tasks: [{ id: 'a1', type: 'local_agent', kind: 'agent', description: 'Check the docs' }] });
+  h.runner.update({ threadId: thread.id, accountId: 'codex-main' });
+  s.result();
+  await tick();
+  s.out({ kind: 'tasks', tasks: [] });
+  assert.equal(s.ended, false, 'kept for the turn that reads the result');
+  s.out({ kind: 'cliTurn', note: 'Agent "Check the docs" completed' });
+  s.result();
+  await tick();
+  assert.equal(s.ended, true);
+  assert.equal(s.endedHard, false);
 });
 
 test('a CLI turn left open when its CLI is released ends as interrupted', async () => {
@@ -1746,7 +1913,8 @@ test('live state: a when chip comes and goes by itself on the poll, with its bad
   fs.writeFileSync(path.join(project, 'count'), '3');
   // No summary asked for: the poll reads it again by itself.
   h.clock.advance(21_000);
-  await settle();
+  // The poll runs a real shell, which a busy Mac can take seconds to start.
+  await until(() => h.runner.get(thread.id).actions !== undefined, 'the chip to show');
   const shown = h.runner.get(thread.id);
   assert.deepEqual(shown.actions?.map((a) => [a.title, a.badge]), [['Your turn', 3]]);
   assert.deepEqual(checkSummary(shown), []);
@@ -1754,8 +1922,7 @@ test('live state: a when chip comes and goes by itself on the poll, with its bad
   assert.ok(!h.events(thread.id).some((e) => e.type === 'system.note'));
   fs.writeFileSync(path.join(project, 'count'), '0');
   h.clock.advance(21_000);
-  await settle();
-  assert.equal(h.runner.get(thread.id).actions, undefined);
+  await until(() => h.runner.get(thread.id).actions === undefined, 'the chip to go');
 });
 
 test('live state: a command action that changes what its chips ask swaps them straight away, without waiting for the poll', async () => {
@@ -1780,6 +1947,51 @@ test('live state: a command action that changes what its chips ask swaps them st
   await h.runner.runAction(thread.id, 'server.stop');
   await h.runner.patchesIdle();
   assert.deepEqual(titles(), ['Start']);
+});
+
+// The turn's end asks for live state again (the agent may have resolved
+// comments or started a server). It went through refreshPatches, which
+// drops the ask while a read is going, so a poll's read that looked before
+// the turn's change stood until the next poll, 20 s later (13 Nov 2026,
+// the implicit state machines scan; the same shape as 589c357f4).
+test("live state: a turn's end while a poll's read is going reads again once that read ends", async () => {
+  const root = tmpDir();
+  const project = path.join(root, 'app');
+  const gate = tmpDir();
+  fs.mkdirSync(path.join(project, '.threadbear/patches'), { recursive: true });
+  // The chip shows while `on` exists. With `hold` there, a read notes what
+  // it saw, then waits for `go` before answering with it.
+  fs.writeFileSync(path.join(project, '.threadbear/patches/server.ts'), `
+    import fs from "node:fs";
+    const gate = ${JSON.stringify(gate)};
+    const on = async ({ cwd }) => {
+      const seen = fs.existsSync(cwd + "/on");
+      if (fs.existsSync(gate + "/hold")) {
+        fs.writeFileSync(gate + "/entered", "");
+        while (!fs.existsSync(gate + "/go")) await new Promise((r) => setTimeout(r, 10));
+      }
+      return seen;
+    };
+    export default { actions: [{ title: "Stop", run: "rm on", when: on }] };`);
+  const h = makeHarness(undefined, {}, { panelsRoot: root, actionShell: ['/bin/sh', '-c'], actionTimeoutMs: 5000 });
+  const { thread } = create(h, { cwd: project });
+  await until(() => h.adapter.last !== undefined && h.runner.get(thread.id).patches?.length === 1, 'the CLI to start and the patch to load');
+  const s = h.adapter.last;
+  s.init();
+  await h.runner.patchesIdle();
+  assert.equal(h.runner.get(thread.id).actions, undefined);
+
+  // The poll's read starts, and looks before the turn starts the server.
+  fs.writeFileSync(path.join(gate, 'hold'), '');
+  h.clock.advance(21_000);
+  await until(() => fs.existsSync(path.join(gate, 'entered')), "the poll's read to start");
+  fs.writeFileSync(path.join(project, 'on'), '');
+  s.result('completed');
+  await tick();
+  fs.rmSync(path.join(gate, 'hold'));
+  fs.writeFileSync(path.join(gate, 'go'), '');
+  await until(() => h.runner.get(thread.id).actions !== undefined, "the turn's change to show without another poll");
+  assert.deepEqual(h.runner.get(thread.id).actions?.map((a) => a.title), ['Stop']);
 });
 
 test('a turn.end hook runs after a turn that edited a matching file, and a failure is told to the agent twice at most', async () => {
@@ -1959,7 +2171,7 @@ test('needs you: asks wait for sub-agents to finish, not for shell jobs', () => 
   assert.equal(t.needsYou, true);
 });
 
-test('needs you: text after an accepted end_turn is dropped, until Mike writes again mid-turn', () => {
+test('needs you: text after an accepted end_turn is dropped, until Alex writes again mid-turn', () => {
   const h = makeHarness();
   const { thread } = create(h);
   const s = h.adapter.last;
@@ -1969,7 +2181,7 @@ test('needs you: text after an accepted end_turn is dropped, until Mike writes a
   // A refused end_turn doesn't end anything, even one a provider reports as
   // ok: the reply after it shows.
   endTurnCall(s, 't0', { needs: 'nothing' });
-  result('t0', 'Not ended: Mike hasn\'t had a reply this turn.');
+  result('t0', 'Not ended: Alex hasn\'t had a reply this turn.');
   s.text('m1', 'The answer.');
   endTurnCall(s, 't1', { needs: 'nothing' });
   result('t1', 'Noted: this thread is done.');
@@ -2065,6 +2277,22 @@ test('needs you: end_turn with archive archives the thread once its turn is over
   assert.deepEqual(checkSequence(h.events(thread.id)), []);
 });
 
+test('needs you: end_turn with archive leaves the thread where it is while a card still waits', async () => {
+  const h = makeHarness();
+  const { thread } = create(h);
+  const s = h.adapter.last;
+  s.init();
+  // A subagent's card (no tool call of the agent's), which outlives the turn.
+  const answer = s.sink.requestApproval({ toolUseId: undefined, name: 'Bash', title: 'Run', input: { command: 'npm test' }, canAlwaysAllow: true, signal: new AbortController().signal });
+  endTurnCall(s, 't1', { needs: 'nothing', archive: true });
+  s.result('completed');
+  assert.equal(h.runner.get(thread.id).archivedAt, undefined, 'not archived with the card waiting');
+  const evs = h.events(thread.id);
+  assert.ok(evs.some((e) => e.type === 'approval.requested'), 'the card was shown');
+  assert.ok(!evs.some((e) => e.type === 'approval.resolved'), 'and still waits for Alex');
+  void answer;
+});
+
 test('needs you: an interrupted turn, or one without archive, leaves the thread where it is', () => {
   const h = makeHarness();
   const { thread } = create(h);
@@ -2081,7 +2309,7 @@ test('needs you: an interrupted turn, or one without archive, leaves the thread 
   assert.equal(h.runner.get(thread.id).archivedAt, undefined);
 });
 
-test('a scheduled run puts an archived thread back in the archive when it ends with nothing for Mike', () => {
+test('a scheduled run puts an archived thread back in the archive when it ends with nothing for Alex', () => {
   const h = makeHarness();
   const { thread } = create(h);
   let s = h.adapter.last;
@@ -2091,7 +2319,7 @@ test('a scheduled run puts an archived thread back in the archive when it ends w
   h.runner.update({ threadId: thread.id, archived: true });
   assert.ok(h.runner.get(thread.id).archivedAt);
 
-  // Nothing new: it comes out for the run, then goes back as Mike left it.
+  // Nothing new: it comes out for the run, then goes back as Alex left it.
   h.runner.send(thread.id, 'Check for a reply', [], { origin: 'schedule', scheduleId: 'sch_1' });
   assert.equal(h.runner.get(thread.id).archivedAt, undefined, 'out of the archive while it runs');
   s = h.adapter.last;
@@ -2110,9 +2338,9 @@ test('a scheduled run puts an archived thread back in the archive when it ends w
   endTurnCall(s, 't3', { needs: 'you', asks: [{ action: 'Send the reply?' }] });
   s.result('completed');
   t = h.runner.get(thread.id);
-  assert.equal(t.archivedAt, undefined, 'stays out when it needs Mike');
+  assert.equal(t.archivedAt, undefined, 'stays out when it needs Alex');
 
-  // So does one Mike wrote into, even if it then ends with nothing.
+  // So does one Alex wrote into, even if it then ends with nothing.
   h.runner.update({ threadId: thread.id, archived: true });
   h.runner.send(thread.id, 'Check for a reply', [], { origin: 'schedule', scheduleId: 'sch_1' });
   s = h.adapter.last;
@@ -2133,7 +2361,7 @@ test('a scheduled run puts an archived thread back in the archive when it ends w
   assert.equal(h.runner.get(thread.id).archivedAt, undefined, 'only one that came out of the archive goes back');
 });
 
-test('a scheduled run that asks Mike something, or is stopped, keeps the thread out even after a later run finds nothing', () => {
+test('a scheduled run that asks Alex something, or is stopped, keeps the thread out even after a later run finds nothing', () => {
   const h = makeHarness();
   const { thread } = create(h);
   let s = h.adapter.last;
@@ -2211,9 +2439,9 @@ test('sharing: a link that stays across off and on, and a new link on request', 
   assert.equal(h.runner.get(thread.id).share!.access, 'link');
 });
 
-test('who started a thread: a row says so when it was not Mike, and end_turn says how it came out', () => {
+test('who started a thread: a row says so when it was not Alex, and end_turn says how it came out', () => {
   const h = makeHarness();
-  // Mike's own has none, and a byline can't give it one.
+  // Alex's own has none, and a byline can't give it one.
   const mine = create(h).thread;
   assert.equal(mine.startedBy, undefined);
   let s = h.adapter.last;
@@ -2257,7 +2485,7 @@ test('who started a thread: the runner and a schedule each say so', () => {
   assert.deepEqual(scheduled.startedBy, { kind: 'schedule', label: 'Schedule' });
 });
 
-test('asked: the summary carries Mike\'s last message, not a schedule\'s or an agent\'s', () => {
+test('asked: the summary carries Alex\'s last message, not a schedule\'s or an agent\'s', () => {
   const h = makeHarness();
   const { thread } = create(h);
   assert.equal(thread.asked, 'Fix the tests more detail here');
@@ -2276,7 +2504,7 @@ test('asked: the summary carries Mike\'s last message, not a schedule\'s or an a
   assert.deepEqual(checkSummary(h.runner.get(thread.id)), []);
 });
 
-test('asked: a review reply is Mike\'s notes, or the option he picked', () => {
+test('asked: a review reply is Alex\'s notes, or the option he picked', () => {
   const review = { id: 'r1', title: 'Grey line', status: 'answered', options: [{ id: 'A', title: 'Results', path: '/a.png' }, { id: 'C', title: 'What you asked', path: '/c.png' }] } as never;
   const head = 'Review: Grey line (r1)\n\n';
   assert.equal(askedLine({ text: head + 'Notes on C (What you asked): try this', reviewId: 'r1', reviewResponse: { notes: { C: 'try this' } } }, [review]), 'try this');

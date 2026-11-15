@@ -4,7 +4,7 @@
 // which the owning runner applies (step 3 of docs/convex-backend.md) and
 // marks done or failed. Nothing here touches a runner directly.
 import { ConvexError, v, type Infer } from 'convex/values';
-import { internalMutation, internalQuery, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
+import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from './_generated/server';
 import type { Doc, Id } from './_generated/dataModel';
 import { messageButton, threadFields, views } from './schema';
 import { checkPhoneToken, hasLiveKey, pageLimit, readRunnerOrder, runnerStatsRows, saveRunnerOrder, sha256, watchRunnersFor } from './lib';
@@ -12,9 +12,10 @@ import { API_VERSION } from './version';
 import { pushOff } from './pushHealth';
 import { imagesFrom, phoneImage, replyImagesFrom } from './share';
 import { deleteIfUnused, endCommandFiles, eventBodyAnswer, finishedArgs, readEventBody, runnerName } from './sync';
-import { docBytes } from './runnerAccess';
+import { docBytes, holdReviewNumbers, holdThreadTimes, isReadableTime } from './runnerAccess';
 import { HEADS_MARK } from './projectHeads';
 import { notesOf } from './projectNotes';
+import { UPLOAD_CLAIM_MS, newClaim } from './uploads';
 
 // A runner not heard from for this long is offline, and a command with no
 // runnerId goes to the main one still online (mainRunner).
@@ -32,20 +33,26 @@ const WAITING_LIMIT = 50;
 
 const row = v.object({ ...threadFields, view: v.union(...views.map((x) => v.literal(x))) });
 const message = v.object({ seq: v.number(), role: v.union(v.literal('user'), v.literal('assistant')), text: v.string(), origin: v.optional(v.string()), at: v.string() });
-const pageMessage = v.object({ seq: v.number(), role: v.union(v.literal('user'), v.literal('assistant'), v.literal('tool')), text: v.string(), origin: v.optional(v.string()), toolKind: v.optional(v.string()), summary: v.optional(v.boolean()), turn: v.optional(v.string()), wokeBy: v.optional(v.array(v.object({ kind: v.string(), description: v.string() }))), buttons: v.optional(v.array(messageButton)), at: v.string() });
+const pageMessage = v.object({ seq: v.number(), role: v.union(v.literal('user'), v.literal('assistant'), v.literal('tool'), v.literal('note')), text: v.string(), origin: v.optional(v.string()), toolKind: v.optional(v.string()), summary: v.optional(v.boolean()), plan: v.optional(v.boolean()), turn: v.optional(v.string()), wokeBy: v.optional(v.array(v.object({ kind: v.string(), description: v.string() }))), buttons: v.optional(v.array(messageButton)), at: v.string() });
 // phone:thread's newest text messages for an old phone, and how far back it
 // looks past tool rows for them.
 const MESSAGES_SHOWN = 20;
+// How much text phone:thread reads of the rows an old phone paged in: a
+// page of 50 full-size messages, with room to spare.
+const PAGED_BYTES = 4 * 1024 * 1024;
 const THREAD_SCAN = 400;
 // phone:messages page sizes.
 const PAGE_DEFAULT = 50;
-// The website asks for more as you scroll back by raising limit, so one
-// live query covers everything it shows.
+// The website and iPhone keep their live page small and read older rows with
+// beforeSeq, once each. iPhone builds before 1.0.5 still raise limit as you
+// scroll back, and have no other way back, so this stays until they're gone.
 const PAGE_MAX = 2000;
 // Without tools: true, how many tool rows a page may look past for its text
 // messages. Most rows are one-line tool rows, so a page stops at this many
 // read whatever it found, and says there's more.
 const TOOL_ROWS_SKIPPED = 4000;
+// And at most this many login notes (role "note"), which no page shows.
+const NOTE_ROWS_SKIPPED = 500;
 const PAGE_BYTES = 8 * 1024 * 1024;
 
 function strip<T extends { _id: unknown; _creationTime: unknown }>(doc: T): Omit<T, '_id' | '_creationTime'> {
@@ -67,6 +74,10 @@ function stripThread(doc: Doc<'threads'>): PhoneThread {
   for (const [k, value] of Object.entries(doc)) if (PHONE_THREAD_KEYS.has(k) && value !== undefined) out[k] = value;
   // Out of its list for a runner key's cap (sync.ts upsertThreads): shown where it belongs.
   if (doc.view === 'overflow') out.view = doc.wantView ?? 'inbox';
+  // Times a phone can read, whoever wrote them and whenever.
+  holdThreadTimes(out, isReadableTime);
+  // Counts a phone turns into an Int, however old the row (Daybreak 109).
+  holdReviewNumbers(out);
   return out as PhoneThread;
 }
 
@@ -192,32 +203,56 @@ export const threadsSince = query({
   },
 });
 
-// Archived threads whose title or last reply has these words (API 16): the
-// phone has only the newest DEN_LIMIT of the den, and searches those itself,
-// so this finds the older ones. Convex's full-text search matches whole
-// words, the last one as a prefix, so "sett" finds "settings". Titles first.
+// Threads with these words (API 16): the phone has only the newest
+// DEN_LIMIT of the den, and searches those itself, so this finds the older
+// ones. Convex's full-text search matches whole words, the last one as a
+// prefix, so "sett" finds "settings". Titles first, then the librarian's
+// search words (API 74), then the last reply.
+// `everywhere` (API 74, a newer phone, which puts each in its own section):
+// threads in any list, and a word said in any message of a thread, after
+// those, so "dentist" finds the thread where the agent searched the email
+// for one. Without it, archived threads as before.
 const SEARCH_LIMIT = 30;
+// Messages read for `everywhere`: a long thread can fill this alone, so more
+// than SEARCH_LIMIT, while each is a whole row of up to 12 KB.
+const SEARCH_MESSAGES = 60;
 export const search = query({
-  args: { token: v.string(), text: v.string() },
+  args: { token: v.string(), text: v.string(), everywhere: v.optional(v.boolean()) },
   returns: v.array(row),
-  handler: async (ctx, { token, text }) => {
+  handler: async (ctx, { token, text, everywhere }) => {
     await checkPhoneToken(ctx, token);
     const words = text.trim();
     if (!words) return [];
-    const byTitle = await ctx.db
-      .query('threads')
-      .withSearchIndex('search_title', (q) => q.search('title', words).eq('view', 'den'))
-      .take(SEARCH_LIMIT);
-    const byPreview = await ctx.db
-      .query('threads')
-      .withSearchIndex('search_preview', (q) => q.search('preview', words).eq('view', 'den'))
-      .take(SEARCH_LIMIT);
+    const byField = (index: 'search_title' | 'search_keywords' | 'search_preview', field: 'title' | 'keywords' | 'preview') =>
+      ctx.db
+        .query('threads')
+        .withSearchIndex(index, (q) => (everywhere ? q.search(field, words) : q.search(field, words).eq('view', 'den')))
+        .take(SEARCH_LIMIT);
+    const found = [...(await byField('search_title', 'title')), ...(await byField('search_keywords', 'keywords')), ...(await byField('search_preview', 'preview'))];
     const seen = new Set<string>();
     const out = [];
-    for (const t of [...byTitle, ...byPreview]) {
+    for (const t of found) {
       if (seen.has(t.threadId) || out.length >= SEARCH_LIMIT) continue;
       seen.add(t.threadId);
       out.push(stripThread(t));
+    }
+    if (everywhere && out.length < SEARCH_LIMIT) {
+      const said = await ctx.db
+        .query('messages')
+        .withSearchIndex('search_text', (q) => q.search('text', words))
+        .take(SEARCH_MESSAGES);
+      for (const m of said) {
+        // Not a login's note (API 78): the phone doesn't show those, so a
+        // thread found by one would have nothing in it to match.
+        if (m.role === 'note') continue;
+        if (seen.has(m.threadId) || out.length >= SEARCH_LIMIT) continue;
+        seen.add(m.threadId);
+        const t = await ctx.db
+          .query('threads')
+          .withIndex('by_threadId', (q) => q.eq('threadId', m.threadId))
+          .first();
+        if (t) out.push(stripThread(t));
+      }
     }
     return out;
   },
@@ -257,7 +292,8 @@ export const thread = query({
     const t = await findThread(ctx, threadId);
     const bySeq = new Map<number, { seq: number; role: 'user' | 'assistant'; text: string; origin?: string; at: string }>();
     const add = (m: Doc<'messages'>) => {
-      if (m.role === 'tool') return;
+      // Nor a login's note (API 78), which only another runner reads.
+      if (m.role === 'tool' || m.role === 'note') return;
       bySeq.set(m.seq, { seq: m.seq, role: m.role, text: m.text, ...(m.origin ? { origin: m.origin } : {}), at: m.at });
     };
     // Tool rows sit between the text ones, so this reads back far enough to
@@ -266,11 +302,20 @@ export const thread = query({
     let read = 0;
     for await (const m of ctx.db.query('messages').withIndex('by_thread_seq', (q) => q.eq('threadId', threadId)).order('desc')) {
       if (++read > THREAD_SCAN) break;
-      if (m.role === 'tool') continue;
+      if (m.role === 'tool' || m.role === 'note') continue;
       add(m);
       if (++text >= MESSAGES_SHOWN) break;
     }
-    for await (const m of ctx.db.query('messages').withIndex('by_thread_pagedAt', (q) => q.eq('threadId', threadId).gt('pagedAt', 0))) add(m);
+    // What an old phone paged in, up to PAGED_BYTES: a runner key can mark
+    // its own rows paged, and enough plan rows (80 KB each, API 72) would
+    // take the read past Convex's limit and the thread wouldn't open
+    // (Codex review, 11 Nov).
+    let pagedBytes = 0;
+    for await (const m of ctx.db.query('messages').withIndex('by_thread_pagedAt', (q) => q.eq('threadId', threadId).gt('pagedAt', 0))) {
+      pagedBytes += m.text.length * 3;
+      if (pagedBytes > PAGED_BYTES) break;
+      add(m);
+    }
     const messages = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
     return { thread: stripThread(t), messages };
   },
@@ -335,15 +380,18 @@ export const heldPicture = query({
 export const messages = query({
   // noImages (API 37): for a client watching phone:images instead, so a new
   // message doesn't read every picture row again.
-  args: { token: v.string(), threadId: v.string(), beforeSeq: v.optional(v.number()), limit: v.optional(v.number()), tools: v.optional(v.boolean()), noImages: v.optional(v.boolean()) },
+  // notes (API 79): also the lines a thread writes when its login runs out
+  // (role "note"), for an app that draws them. One built before can't read
+  // the role, so it's only for the asking.
+  args: { token: v.string(), threadId: v.string(), beforeSeq: v.optional(v.number()), limit: v.optional(v.number()), tools: v.optional(v.boolean()), noImages: v.optional(v.boolean()), notes: v.optional(v.boolean()) },
   // images: from the page's first row on (share.ts), a shared thread's
   // uploaded pictures (API 8), so Mike's page shows what the shared one
   // does, and any thread's reply and pinned pictures (API 24).
   returns: v.object({ messages: v.array(pageMessage), hasMore: v.boolean(), images: v.optional(v.array(phoneImage)) }),
-  handler: async (ctx, { token, threadId, beforeSeq, limit, tools, noImages }) => {
+  handler: async (ctx, { token, threadId, beforeSeq, limit, tools, noImages, notes: withNotes }) => {
     await checkPhoneToken(ctx, token);
     const want = pageLimit(limit, PAGE_DEFAULT, PAGE_MAX);
-    const out: { seq: number; role: 'user' | 'assistant' | 'tool'; text: string; origin?: string; toolKind?: string; summary?: boolean; turn?: string; buttons?: Doc<'messages'>['buttons']; at: string }[] = [];
+    const out: { seq: number; role: 'user' | 'assistant' | 'tool' | 'note'; text: string; origin?: string; toolKind?: string; summary?: boolean; turn?: string; buttons?: Doc<'messages'>['buttons']; at: string }[] = [];
     const q = ctx.db
       .query('messages')
       .withIndex('by_thread_seq', (x) => (beforeSeq === undefined ? x.eq('threadId', threadId) : x.eq('threadId', threadId).lt('seq', beforeSeq)))
@@ -354,7 +402,20 @@ export const messages = query({
     let read = 0;
     let bytes = 0;
     let hasMore = false;
+    let notes = 0;
     for await (const m of q) {
+      // A login's note (API 78) goes only to an app that asks for them
+      // (`notes`, API 79): one built before can't read the role. For the
+      // rest it's looked past without counting as one of the page's rows:
+      // counted, a page asked for under a few notes came back empty saying
+      // there was more, with no row to page from (Codex's review, 13 Nov).
+      if (m.role === 'note' && !withNotes) {
+        if (++notes > NOTE_ROWS_SKIPPED || (bytes += docBytes(m)) > PAGE_BYTES) {
+          hasMore = true;
+          break;
+        }
+        continue;
+      }
       // And bytes: a page of big rows stops short, saying there's more, rather than going past what a query may read.
       if (++read > most || (bytes += docBytes(m)) > PAGE_BYTES) {
         hasMore = true;
@@ -365,7 +426,7 @@ export const messages = query({
         hasMore = true;
         break;
       }
-      out.push({ seq: m.seq, role: m.role, text: m.text, ...(m.origin ? { origin: m.origin } : {}), ...(m.toolKind ? { toolKind: m.toolKind } : {}), ...(m.summary ? { summary: true } : {}), ...(m.turn ? { turn: m.turn } : {}), ...(m.wokeBy ? { wokeBy: m.wokeBy } : {}), ...(m.buttons?.length ? { buttons: m.buttons } : {}), at: m.at });
+      out.push({ seq: m.seq, role: m.role, text: m.text, ...(m.origin ? { origin: m.origin } : {}), ...(m.toolKind ? { toolKind: m.toolKind } : {}), ...(m.summary ? { summary: true } : {}), ...(m.plan ? { plan: true } : {}), ...(m.turn ? { turn: m.turn } : {}), ...(m.wokeBy ? { wokeBy: m.wokeBy } : {}), ...(m.buttons?.length ? { buttons: m.buttons } : {}), at: m.at });
     }
     out.reverse();
     const from = hasMore || beforeSeq !== undefined ? out[0]?.seq ?? 0 : 0;
@@ -580,7 +641,8 @@ export const wakes = query({
   handler: async (ctx, { token }) => {
     await checkPhoneToken(ctx, token);
     const out = [];
-    for await (const w of ctx.db.query('scheduleWakes')) out.push({ scheduleId: w.scheduleId, ...(w.threadId ? { threadId: w.threadId } : {}), ...(w.nextRunAt ? { nextRunAt: w.nextRunAt } : {}) });
+    // A wake saved before syncWake checked its time is held to the same check.
+    for await (const w of ctx.db.query('scheduleWakes')) out.push({ scheduleId: w.scheduleId, ...(w.threadId ? { threadId: w.threadId } : {}), ...(isReadableTime(w.nextRunAt) ? { nextRunAt: w.nextRunAt } : {}) });
     return out;
   },
 });
@@ -710,6 +772,19 @@ export const slashCommands = mutation({
     await checkPhoneToken(ctx, token);
     const t = await findThread(ctx, threadId);
     return queue(ctx, t.runnerId, 'slashCommands', threadId, {});
+  },
+});
+
+// Stop (API 69): ends the thread's running turn, as Stop on the Mac does.
+// The `interrupt` command the main Mac sends another runner (relay.ts),
+// which every runner from API 44 on applies.
+export const interrupt = mutation({
+  args: { token: v.string(), threadId: v.string() },
+  returns: v.id('commands'),
+  handler: async (ctx, { token, threadId }) => {
+    await checkPhoneToken(ctx, token);
+    const t = await findThread(ctx, threadId);
+    return queue(ctx, t.runnerId, 'interrupt', threadId, {});
   },
 });
 
@@ -868,26 +943,45 @@ async function livePhoneTicket(ctx: QueryCtx, ticket: string) {
   return t && !t.revokedAt && t.expiresAt >= Date.now() ? row : null;
 }
 
-// For /phone/upload, before it stores anything.
-export const phoneTicketOk = internalQuery({
+// /phone/upload's first step, before it reads the body (uploads.ts
+// takeUpload): the ticket is spent here, so of many requests with one
+// ticket only the first reads anything. "later": the day's bytes are
+// already used up, so nothing is read.
+export const claimPhoneUpload = internalMutation({
   args: { ticket: v.string() },
-  returns: v.boolean(),
-  handler: async (ctx, { ticket }) => (await livePhoneTicket(ctx, ticket)) !== null,
-});
-
-// The stored file is the ticket's token's. False (the route then deletes the
-// file): a dead or used ticket, or a file over the size cap. "later": over
-// the day's bytes, which time fixes (429).
-export const redeemPhoneUpload = internalMutation({
-  args: { ticket: v.string(), storageId: v.id('_storage'), bytes: v.number() },
-  returns: v.union(v.boolean(), v.literal('later')),
-  handler: async (ctx, { ticket, storageId, bytes }) => {
+  returns: v.union(v.object({ claim: v.string() }), v.literal(false), v.literal('later')),
+  handler: async (ctx, { ticket }) => {
     const row = await livePhoneTicket(ctx, ticket);
     if (!row) return false;
     const now = Date.now();
-    // Spent whatever happens: a refused ticket can't be tried again.
-    await ctx.db.patch(row._id, { usedAt: now, bytes: Number.isFinite(bytes) && bytes >= 0 ? bytes : 0 });
-    if (!(bytes >= 0) || bytes > PHONE_UPLOADS.maxBytes) return false;
+    if ((await uploadsOf(ctx, row.tokenId, now, row._id)).bytes >= PHONE_UPLOADS.bytesPerDay) {
+      await ctx.db.patch(row._id, { usedAt: now, bytes: 0 });
+      return 'later';
+    }
+    const claim = newClaim();
+    await ctx.db.patch(row._id, { usedAt: now, bytes: 0, claim });
+    return { claim };
+  },
+});
+
+// /phone/upload's last step: the stored file is the claim's token's. False
+// (the route then deletes the file): not this request's claim, the phone
+// revoked meanwhile, or no file (too big, or it broke off), which still
+// counts what came against the day. "later": over the day's bytes, which
+// time fixes (429).
+export const finishPhoneUpload = internalMutation({
+  args: { ticket: v.string(), claim: v.string(), storageId: v.optional(v.id('_storage')), bytes: v.number() },
+  returns: v.union(v.boolean(), v.literal('later')),
+  handler: async (ctx, { ticket, claim, storageId, bytes }) => {
+    if (!/^[0-9a-f]{48}$/.test(ticket) || !claim) return false;
+    const hash = await sha256(ticket);
+    const row = await ctx.db.query('phoneUploads').withIndex('by_hash', (q) => q.eq('ticketHash', hash)).first();
+    const now = Date.now();
+    if (!row || row.claim !== claim || !row.usedAt || row.usedAt <= now - UPLOAD_CLAIM_MS) return false;
+    const t = await ctx.db.get(row.tokenId);
+    if (!t || t.revokedAt || t.expiresAt < now) return false;
+    await ctx.db.patch(row._id, { claim: undefined, bytes: Number.isFinite(bytes) && bytes >= 0 ? bytes : 0 });
+    if (!storageId || !(bytes >= 0) || bytes > PHONE_UPLOADS.maxBytes) return false;
     if ((await uploadsOf(ctx, row.tokenId, now, row._id)).bytes + bytes > PHONE_UPLOADS.bytesPerDay) return 'later';
     await ctx.db.patch(row._id, { storageId });
     return true;
@@ -990,23 +1084,32 @@ export const loadEarlier = mutation({
 // An APNs device token as the phone sends it: hex (32 bytes today; Apple
 // says it can grow, so up to 100).
 const APNS_TOKEN = /^[0-9a-fA-F]{16,200}$/;
+// A Firebase registration token, as an Android phone sends it (platform
+// 'android'): letters, digits, "_", "-" and ":". About 160 characters today;
+// Firebase promises no length, so there is room.
+const FCM_TOKEN = /^[A-Za-z0-9_:-]{20,4096}$/;
 export const MAX_DEVICES_PER_TOKEN = 5;
 
 export const registerDevice = mutation({
   // pushKey (API 4): the phone's own key for what goes through the push
   // relay, base64 of 32 bytes. Kept from an earlier registration if left out.
-  args: { token: v.string(), apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), pushKey: v.optional(v.string()) },
+  // platform (API 66): "android" when apnsToken is the phone's Firebase token,
+  // not an Apple one (the field keeps its name; the table is indexed by it).
+  // Left out, as every iPhone does, it is an Apple token.
+  args: { token: v.string(), apnsToken: v.string(), environment: v.union(v.literal('sandbox'), v.literal('production')), pushKey: v.optional(v.string()), platform: v.optional(v.literal('android')) },
   returns: v.null(),
-  handler: async (ctx, { token, apnsToken, environment, pushKey }) => {
+  handler: async (ctx, { token, apnsToken, environment, pushKey, platform }) => {
     if (pushKey !== undefined && !/^[A-Za-z0-9+/]{43}=$/.test(pushKey)) throw new ConvexError({ kind: 'invalid', message: 'pushKey must be base64 of 32 bytes' });
-    if (!APNS_TOKEN.test(apnsToken)) throw new ConvexError({ kind: 'invalid', message: 'apnsToken must be the device token in hex' });
+    if (platform === 'android') {
+      if (!FCM_TOKEN.test(apnsToken)) throw new ConvexError({ kind: 'invalid', message: 'apnsToken must be the phone\'s Firebase token' });
+    } else if (!APNS_TOKEN.test(apnsToken)) throw new ConvexError({ kind: 'invalid', message: 'apnsToken must be the device token in hex' });
     const t = await checkPhoneToken(ctx, token);
     const existing = await ctx.db
       .query('devices')
       .withIndex('by_apnsToken', (q) => q.eq('apnsToken', apnsToken))
       .unique();
     const key = pushKey ?? existing?.pushKey;
-    const row = { apnsToken, environment, tokenName: t.name, tokenId: t.id, updatedAt: Date.now(), ...(existing?.notify ? { notify: existing.notify } : {}), ...(key ? { pushKey: key } : {}) };
+    const row = { apnsToken, environment, tokenName: t.name, tokenId: t.id, updatedAt: Date.now(), ...(existing?.notify ? { notify: existing.notify } : {}), ...(key ? { pushKey: key } : {}), ...(platform ? { platform } : {}) };
     // A phone token's oldest registrations give way to a new one (or one it
     // takes over from another token), so a token holds at most
     // MAX_DEVICES_PER_TOKEN rows: a phone reinstalled gets a new APNs token,
@@ -1081,7 +1184,7 @@ async function knownRunner(ctx: QueryCtx, runnerId: string): Promise<string> {
 // what the runner's own pendingCommands reads. One that waits too long goes
 // (sync:pruneFiles, COMMAND_KEEP_MS). Its photos are recorded in commandFiles
 // so a delete elsewhere sees they're still on their way (sync.ts storageInUse).
-async function queue(ctx: MutationCtx, runnerId: string, kind: 'send' | 'respond' | 'update' | 'create' | 'page' | 'share' | 'quickAsk' | 'schedule' | 'picture' | 'press' | 'slashCommands', threadId: string | undefined, args: Record<string, unknown>) {
+async function queue(ctx: MutationCtx, runnerId: string, kind: 'send' | 'respond' | 'update' | 'create' | 'page' | 'share' | 'quickAsk' | 'schedule' | 'picture' | 'press' | 'slashCommands' | 'interrupt', threadId: string | undefined, args: Record<string, unknown>) {
   let n = 0;
   let bytes = docBytes(args);
   for await (const c of ctx.db.query('commands').withIndex('by_runner_state', (q) => q.eq('runnerId', runnerId).eq('state', 'pending'))) {

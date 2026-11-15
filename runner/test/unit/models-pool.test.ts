@@ -40,7 +40,7 @@ function setup(o: { accounts?: Account[]; pools?: Pool[]; pool?: string | null; 
   let accounts = o.accounts ?? [acct('claude-main', { room: 50 }), acct('claude-1', { room: 80 }), acct('claude-2', { room: 90 }), acct('codex-main', { provider: 'codex', room: 90 })];
   const pools = o.pools ?? [
     { id: 'claude', title: 'Claude', accountIds: ['claude-main', 'claude-1'] },
-    { id: 'convex', title: 'Convex', accountIds: ['claude-2'] },
+    { id: 'work', title: 'Work', accountIds: ['claude-2'] },
     { id: 'everything', title: 'Everything', accountIds: ['codex-main', 'claude-main'] },
   ];
   const settings: ModelSettings = { privateFolders: [], pool: o.pool === undefined ? 'claude' : o.pool };
@@ -103,8 +103,8 @@ test('pool: it stays on the login it used last while that has room, then moves',
   s.setAccounts([acct('claude-main', { room: 95 }), acct('claude-1', { room: 40 })]);
   await s.models.generate({ feature: 'titles', prompt: 'b' });
   assert.equal(s.cli[1].account.id, 'claude-1');
-  // Under 10%: move.
-  s.setAccounts([acct('claude-main', { room: 95 }), acct('claude-1', { room: 5 })]);
+  // Under 1%: move.
+  s.setAccounts([acct('claude-main', { room: 95 }), acct('claude-1', { room: 0.5 })]);
   await s.models.generate({ feature: 'titles', prompt: 'c' });
   assert.equal(s.cli[2].account.id, 'claude-main');
 });
@@ -120,7 +120,7 @@ test('pool: a login that answers it is out of room counts as run dry, and the ne
 });
 
 test('pool: with every login out of room it says no-room, though a pool is there', async () => {
-  const s = setup({ accounts: [acct('claude-main', { room: 3 }), acct('claude-1', { blocked: true })] });
+  const s = setup({ accounts: [acct('claude-main', { room: 0.3 }), acct('claude-1', { blocked: true })] });
   const r = await s.models.generate({ feature: 'projects', prompt: 'a' });
   assert.equal(r.ok ? 'sent' : r.reason, 'no-room');
   assert.match(r.ok ? '' : r.message, /Every login in Claude is out of room/);
@@ -156,9 +156,9 @@ test('pool: only the pool\'s Claude logins are used, never a noted login outside
   const s = setup({ pool: 'everything' });
   await s.models.generate({ feature: 'titles', prompt: 'a' });
   assert.deepEqual(s.cli.map((c) => c.account.id), ['claude-main']);
-  const convex = setup({ pool: 'convex' });
-  await convex.models.generate({ feature: 'titles', prompt: 'a' });
-  assert.deepEqual(convex.cli.map((c) => c.account.id), ['claude-2'], 'only when Mike picks that pool');
+  const work = setup({ pool: 'work' });
+  await work.models.generate({ feature: 'titles', prompt: 'a' });
+  assert.deepEqual(work.cli.map((c) => c.account.id), ['claude-2'], 'only when Alex picks that pool');
 });
 
 test('pool: classify and extract ask for structured output and read it', async () => {
@@ -209,20 +209,20 @@ test('settings: models.pool is a pool id or null, saved to runner.json', () => {
   const home = tmpDir();
   ensureHome(home);
   const cfg = testConfig(home);
-  const svc = new SettingsService({ config: cfg, publish: () => {}, poolIds: () => ['claude', 'convex'] });
+  const svc = new SettingsService({ config: cfg, publish: () => {}, poolIds: () => ['claude', 'work'] });
   const m = settingsMethods(svc);
   assert.equal(svc.get().models.pool, 'claude');
-  assert.throws(() => m['settings.update']({ models: { pool: 'nope' } }), /No pool called nope. Pools: claude, convex/);
+  assert.throws(() => m['settings.update']({ models: { pool: 'nope' } }), /No pool called nope. Pools: claude, work/);
   assert.throws(() => m['settings.update']({ models: { pool: 3 } }), /pool id or null/);
-  m['settings.update']({ models: { pool: 'convex' } });
-  assert.equal(cfg.models.pool, 'convex');
-  assert.equal(readRunnerJson(home).models?.pool, 'convex');
+  m['settings.update']({ models: { pool: 'work' } });
+  assert.equal(cfg.models.pool, 'work');
+  assert.equal(readRunnerJson(home).models?.pool, 'work');
   m['settings.update']({ models: { pool: null } });
   assert.equal(svc.get().models.pool, null);
   assert.equal(readRunnerJson(home).models?.pool, null);
 });
 
-test('cli: the arguments keep everything of Mike\'s setup out and never use --bare', () => {
+test('cli: the arguments keep everything of Alex\'s setup out and never use --bare', () => {
   const args = cliArgs({ model: 'claude-haiku-5-5', system: 'Name it', jsonSchema: { type: 'object' } });
   for (const flag of ['-p', '--no-session-persistence', '--strict-mcp-config', '--disable-slash-commands']) assert.ok(args.includes(flag), flag);
   const after = (f: string) => args[args.indexOf(f) + 1];

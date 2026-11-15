@@ -1,0 +1,129 @@
+# The GPUI desktop app (desktop/: the runner connection and the app) on
+# Linux, Mac and Windows: every Rust test (including signing in to the mock
+# runner), the behaviour specs in features/ against a real window, and a build
+# for each to download from the run's artifacts.
+# Nothing is signed: the Mac app needs right-click Open the first time, and
+# Windows SmartScreen asks once.
+#
+# tb land holds a landing that changes what this checks while its last run on
+# main failed (runner/src/land-gate.ts, docs/thread-worktrees.md): it was red
+# for two days of GPUI landings (10 to 12 Nov) over what only GitHub's Macs,
+# Linux and Windows see, which tb land's quick check on Tinker Desk can't.
+# tb land: hold while red
+name: Desktop app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - desktop/**
+      - runner/src/protocol.ts
+      - runner/src/rpc-auth.ts
+      - web/src/sections.ts
+      - web/src/format.ts
+      - app/Tools/mock-runner/**
+      - features/**
+      - .github/workflows/desktop.yml
+  pull_request:
+    paths:
+      - desktop/**
+      - runner/src/protocol.ts
+      - runner/src/rpc-auth.ts
+      - web/src/sections.ts
+      - web/src/format.ts
+      - app/Tools/mock-runner/**
+      - features/**
+      - .github/workflows/desktop.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A PR's newer push cancels its run in progress. Main's don't: on 12 Nov main
+# was pushed about every 7 minutes, each run takes about 40, and every run was
+# cancelled by the next, so main went hours with no verdict and tb land's gate
+# held on an old red one. Now main's runs go one at a time; GitHub keeps one
+# waiting per group and a newer push replaces it, so a busy morning batches
+# into the newest commit rather than piling up Mac and Windows minutes.
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    # Windows needs time for its release build after the behaviour specs.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, os: ubuntu-24.04 }
+          - { name: Mac, os: macos-26 }
+          - { name: Windows, os: windows-latest }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      # The stable toolchain, from a pinned commit of the action that installs it.
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable, 15 Nov 2026
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: desktop
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        # xvfb, mesa and dbus are for the behaviour specs: a window with no screen.
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libfontconfig-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev libvulkan-dev xvfb mesa-vulkan-drivers dbus-x11
+      - name: Install the mock runner and the specs
+        run: |
+          npm ci --prefix app/Tools/mock-runner
+          npm ci --prefix features
+      - name: The specs line up with their steps
+        working-directory: features
+        run: node verify-pairing.mjs
+      - name: Rust tests (with the mock runner)
+        run: cargo test --manifest-path desktop/Cargo.toml
+      - name: Native text bridge contract
+        if: runner.os == 'macOS'
+        run: bash desktop/scripts/test-native-text.sh
+      - name: File-drop regression tests
+        run: cargo test --locked --manifest-path desktop/Cargo.toml -p threadbear-gpui --features automation --test file_drop
+      - name: Loader repaint and lifetime regressions
+        run: |
+          cargo test --locked --manifest-path desktop/Cargo.toml -p threadbear-gpui --features automation,frame-stats --bin threadbear-gpui spinner:: -- --list > loader-tests.txt
+          cat loader-tests.txt
+          count=$(awk '/^spinner::.*: test$/ { n++ } END { print n+0 }' loader-tests.txt)
+          test "$count" -ge 10
+          cargo test --locked --manifest-path desktop/Cargo.toml -p threadbear-gpui --features automation,frame-stats --bin threadbear-gpui spinner::
+          cargo test --locked --manifest-path desktop/Cargo.toml -p threadbear-gpui --features automation,frame-stats --bin threadbear-gpui frame_stats::loader_probe_tests:: -- --list > loader-probe-tests.txt
+          cat loader-probe-tests.txt
+          count=$(awk '/^frame_stats::loader_probe_tests::.*: test$/ { n++ } END { print n+0 }' loader-probe-tests.txt)
+          test "$count" -ge 1
+          cargo test --locked --manifest-path desktop/Cargo.toml -p threadbear-gpui --features automation,frame-stats --bin threadbear-gpui frame_stats::loader_probe_tests::
+      - name: Behaviour specs
+        run: |
+          cargo build --manifest-path desktop/Cargo.toml -p threadbear-gpui --features automation
+          cd features
+          TB_APP=gpui TB_RETRY=1 node_modules/.bin/cucumber-js
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: spec-reports-${{ matrix.name }}
+          path: features/reports/
+          if-no-files-found: ignore
+      - name: Build the GPUI app
+        run: cargo build --release --manifest-path desktop/Cargo.toml -p threadbear-gpui
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: threadbear-desktop-${{ matrix.name }}
+          path: |
+            desktop/target/release/threadbear-gpui
+            desktop/target/release/threadbear-gpui.exe
+          if-no-files-found: error

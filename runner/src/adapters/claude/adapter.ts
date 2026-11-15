@@ -1,26 +1,28 @@
 import crypto from 'node:crypto';
+import { denySecrets } from '../../secrets-guard.ts';
 import { CONFINED_NO_SANDBOX, sandboxSpawner, type SandboxConfig } from '../../sandbox.ts';
 import os from 'node:os';
 import { query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
-import type { HookInput, McpServerConfig, ModelInfo, Options, PermissionResult, Query, SDKUserMessage, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
-import type { Account, EffortLevel, ModelChoice, PermissionMode, Question, QueuedAnswers, QueuedCall } from '../../protocol.ts';
+import type { HookInput, McpServerConfig, ModelInfo, Options, PermissionResult, Query, SDKControlGetContextUsageResponse, SDKUserMessage, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk';
+import type { Account, ContextUsage, EffortLevel, ModelChoice, PermissionMode, Question, QueuedAnswers, QueuedCall } from '../../protocol.ts';
 import { isEffortLevel } from '../../protocol.ts';
 import fs from 'node:fs';
 import type { AgentAdapter, AgentSession, RewindRequest, RewindResult, SessionSink, StartSessionOptions, UserInput } from '../types.ts';
 import { RewindRefusedError } from '../types.ts';
 import type { SlashCommand } from '../../slash-commands.ts';
+import { frontmatter } from '../../claude-trust.ts';
 import { cutPointBefore, sessionTranscriptPath } from '../../transcripts.ts';
 import type { Logger } from '../../log.ts';
 import { ClaudeNormalizer, fileContext } from './normalize.ts';
 import { groupSpawner, type ProcessRegistry } from '../../proc.ts';
 import { prepareImageForModel } from '../../media.ts';
 import { placePictures } from '../../pictures.ts';
-import { EDIT_TOOLS, cardInput, toolTitle, tooLongForCard } from '../../tools.ts';
+import { EDIT_TOOLS, cardDecisive, cardInput, toolTitle, tooLongForCard } from '../../tools.ts';
 import { codeWriteNote, codeWriteReason, runsAsCodeByName, type CodeWrite } from '../../code-writes.ts';
 import path from 'node:path';
 import { RUNNER_VERSION } from '../../config.ts';
 import { stripModelSuffix } from '../../accounts.ts';
-import { END_TURN_FULL_NAME, END_TURN_NUDGE, endTurnMessageStands, endTurnWantsReply, ONE_REPLY_END_TURN_NUDGE, ONE_REPLY_WRITE_NUDGE, owedReplyAfterCompact, WakeRead } from '../../needs.ts';
+import { END_TURN_FULL_NAME, END_TURN_NUDGE, endTurnMessageStands, endTurnWantsReply, needsFromTool, ONE_REPLY_END_TURN_NUDGE, ONE_REPLY_WRITE_NUDGE, owedReplyAfterCompact, replyAsks, replyAsksNudge, WakeRead } from '../../needs.ts';
 
 // Variables a parent Claude Code session sets for its own children. If the
 // runner was started from inside one (tests, a terminal in T3), they would
@@ -73,6 +75,13 @@ export function sdkPermissionMode(mode: PermissionMode): 'bypassPermissions' | '
   if (mode === 'auto' || mode === 'plan') return mode;
   return mode === 'full' ? 'bypassPermissions' : 'default';
 }
+
+// How many end_turn calls are refused for one message the CLI hasn't handed
+// over. The CLI hands every waiting message over with the first refusal's
+// result (two sent together both started then, 13 Nov 2026), so the second is
+// for one it kept back anyway (from Codex's review), and the limit is so a
+// frame that never comes can't keep a turn from ending.
+const UNREAD_REFUSALS = 2;
 
 // Streaming input for query(): the runner pushes one user message per turn
 // and ends it to let the CLI exit.
@@ -336,6 +345,10 @@ const ASKS_IN_ASK = new Set([...EDIT_TOOLS, 'NotebookEdit', 'Bash', 'WebFetch'])
 // The PreToolUse hook's tools: edits (onEditCall) and anything that can
 // queue (wouldAsk). A regex, as the CLI reads it.
 const QUEUE_HOOK_MATCHER = [...ASKS_IN_ASK, 'mcp__.*'].join('|');
+// Tools that only read, checked for the secrets folder (secrets-guard.ts) on
+// every session: one on Full can be lowered mid-session, and the matcher is
+// fixed when it starts. The hook returns at once on Full.
+const SECRETS_ONLY_TOOLS = ['Read', 'Grep', 'Glob', 'LS', 'NotebookRead'];
 
 // A queued call as a card listed it: its tool, its whole input and
 // whether it wrote code then. An allow holds only for exactly that.
@@ -402,6 +415,13 @@ class ClaudeSession implements AgentSession {
   private messageStands = false;
   private pastEndTurn = false;
   private endTurnCall?: string;
+  // Each end_turn call's arguments until its result, then whether the one
+  // taken said nothing was needed, and the words written after it: a reply
+  // that closes on a question under a done card is sent back for its card
+  // (onStop; needs.ts, REPLY_ASKS).
+  private endTurnInputs = new Map<string, unknown>();
+  private doneCard = false;
+  private replyAfterEnd = '';
   // Whether the agent has read a background task's notification that came
   // into the turn: from then its end_turn is behind it, so the Stop hook
   // asks for another (needs.ts, WakeRead).
@@ -415,6 +435,14 @@ class ClaudeSession implements AgentSession {
   // a new message from the user (the agent goes on to that) or the turn's
   // result ends it.
   private owedReply?: string[];
+  // Messages sent that the CLI hasn't handed to the agent yet, by uuid: one
+  // sent while a response is being written waits in the CLI's queue until
+  // that response's tools have run, and the CLI's command_lifecycle frame
+  // "started" says when it goes over (unreadMessage), with how many calls
+  // end_turn has refused for each: a refusal is what hands it over, so a
+  // second is only for one the CLI kept back, and there is never a third.
+  private notStarted = new Map<string, number>();
+  private lifecycle = false;
 
   constructor(opts: StartSessionOptions, sink: SessionSink, deps: ClaudeAdapterDeps) {
     this.opts = opts;
@@ -467,7 +495,9 @@ class ClaudeSession implements AgentSession {
           // (onQueuedCall), before any allow rule or Auto's classifier could
           // let it through: only tools that can queue, so the rest don't
           // make a round trip per call.
-          { matcher: QUEUE_HOOK_MATCHER, hooks: [async (input) => this.onQueuedCall(input) ?? this.onEditCall(input)] },
+          // ...and keeps the runner's token from a thread that isn't on Full
+          // access (secrets-guard.ts).
+          { matcher: [QUEUE_HOOK_MATCHER, ...SECRETS_ONLY_TOOLS].join('|'), hooks: [async (input) => this.onSecretsCall(input) ?? this.onQueuedCall(input) ?? this.onEditCall(input)] },
           // A hook's ask comes before allow rules, so it's how a folder's
           // untrusted ones stop applying once the thread leaves Full
           // (askBeforeEveryTool). Only on a session that may need it.
@@ -491,7 +521,7 @@ class ClaudeSession implements AgentSession {
     // through before its own checks (Auto's classifier included) rather
     // than relying on canUseTool being reached. They're not the thread's
     // rules, so they're never saved with them.
-    const allowed = [...(opts.allowRules ?? []), ...[...(deps.neverAsk ?? [])].filter((n) => !deps.alwaysAsk?.has(n))];
+    const allowed = [...(opts.allowRules ?? []).filter((r) => !isTbPrefixRule(r)), ...[...(deps.neverAsk ?? [])].filter((n) => !deps.alwaysAsk?.has(n))];
     if (allowed.length) options.allowedTools = [...new Set(allowed)];
     if (opts.resume) {
       options.resume = opts.sessionId;
@@ -508,6 +538,7 @@ class ClaudeSession implements AgentSession {
     const stop = input as { stop_hook_active?: boolean; background_tasks?: unknown[] };
     const ended = this.endTurnTaken;
     const wrote = this.wroteAfterEnd || this.messageStands;
+    const asks = this.doneCard && this.wroteAfterEnd ? replyAsks(this.replyAfterEnd) : undefined;
     this.forgetEndTurn();
     // A turn that ended in plain text leaves the runner reading the card
     // from the prose (needs.ts, needsFromText), which drops what end_turn
@@ -520,7 +551,15 @@ class ClaudeSession implements AgentSession {
     if (!this.hasEndTurn || stop.stop_hook_active || stop.background_tasks?.length) return {};
     // One reply: end_turn without words after it leaves no reply, so the
     // agent is asked for it, once (the hook's own guard, stop_hook_active).
-    if (ended) return this.oneReply && !wrote ? { decision: 'block', reason: ONE_REPLY_WRITE_NUDGE } : {};
+    if (ended && this.oneReply && !wrote) return { decision: 'block', reason: ONE_REPLY_WRITE_NUDGE };
+    // ...and one whose reply closes by asking for an answer, over a card that
+    // said nothing was needed, is asked for the card, once. The runner is told
+    // first, so the end_turn it brings isn't refused as a repeat.
+    if (ended && this.oneReply && asks) {
+      this.sink.output({ kind: 'endTurnNudge', reopen: true });
+      return { decision: 'block', reason: replyAsksNudge(asks) };
+    }
+    if (ended) return {};
     this.sink.output({ kind: 'endTurnNudge' });
     return { decision: 'block', reason: this.oneReply ? ONE_REPLY_END_TURN_NUDGE : END_TURN_NUDGE };
   }
@@ -545,6 +584,8 @@ class ClaudeSession implements AgentSession {
     this.messageStands = false;
     this.pastEndTurn = false;
     this.endTurnCall = undefined;
+    this.doneCard = false;
+    this.replyAfterEnd = '';
   }
 
   private onEndTurn(input: HookInput): Record<string, never> {
@@ -572,6 +613,15 @@ class ClaudeSession implements AgentSession {
     if (!kind) return {};
     this.codeWrites.add(id);
     return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'ask', permissionDecisionReason: codeWriteReason(kind) } };
+  }
+
+  private onSecretsCall(input: HookInput): { hookSpecificOutput: { hookEventName: 'PreToolUse'; permissionDecision: 'deny'; permissionDecisionReason: string } } | undefined {
+    if (this.mode === 'full') return undefined;
+    const call = input as { tool_name?: string; tool_input?: unknown; cwd?: string };
+    const home = this.opts.env?.THREADBEAR_HOME;
+    if (!home || typeof call.tool_name !== 'string' || !call.tool_input || typeof call.tool_input !== 'object') return undefined;
+    const why = denySecrets(call.tool_name, call.tool_input as Record<string, unknown>, home, typeof call.cwd === 'string' ? call.cwd : undefined);
+    return why ? { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: why } } : undefined;
   }
 
   private onQueuedCall(input: HookInput): { hookSpecificOutput: { hookEventName: 'PreToolUse'; permissionDecision: 'deny'; permissionDecisionReason: string } } | undefined {
@@ -628,7 +678,7 @@ class ClaudeSession implements AgentSession {
       if (!after || shown?.has(id) || this.queuedAnswers.has(id) || this.checkedCalls.has(id) || !this.wouldAsk(call.name, call.input)) continue;
       const target = EDIT_TOOLS.has(call.name) ? this.editTarget(call.input) : undefined;
       const code: CodeWrite = target !== undefined && this.runsAsCode(target);
-      const card = cardInput(call.input, call.name.startsWith('mcp__') || code ? 'all' : ['command']);
+      const card = cardInput(call.input, cardDecisive(call.name, code));
       if (card.tooLong) continue;
       const title = toolTitle(call.name, call.input, this.opts.cwd);
       grants.set(id, { name: call.name, input: JSON.stringify(call.input), code });
@@ -701,9 +751,11 @@ class ClaudeSession implements AgentSession {
           this.wake.reset();
           this.owedReply = undefined;
           this.endTurnAsks.clear();
+          this.endTurnInputs.clear();
           this.openCalls.clear();
           this.checkedCalls.clear();
         }
+        this.noteLifecycle(msg as Record<string, unknown>);
         this.noteCalls(msg as Record<string, unknown>);
         for (let out of this.normalizer.handle(msg as Record<string, unknown>)) {
           // The mode the call went through on, recorded at the call.
@@ -726,18 +778,32 @@ class ClaudeSession implements AgentSession {
             if (this.wake.see(ev)) this.forgetEndTurn();
             if (ev.type === 'tool.call' && ev.name === END_TURN_FULL_NAME) {
               this.endTurnCall = ev.itemId;
+              this.endTurnInputs.set(ev.itemId, ev.input);
               const asks = Array.isArray(ev.input.asks) ? (ev.input.asks as { question?: unknown; action?: unknown }[]) : [];
               this.endTurnAsks.set(ev.itemId, asks.map((a) => String(a?.question ?? a?.action ?? '')).filter(Boolean));
             }
             else if (ev.type === 'tool.result' && ev.itemId === this.endTurnCall && ev.ok) {
               this.pastEndTurn = true;
               this.messageStands = endTurnMessageStands(ev);
+              // Only a call that asked for its reply next: after "Stop here"
+              // the words that count were written before it. A repeat that
+              // only added archive or snooze ("Added: ...") changes neither
+              // the card nor the reply under it (from Codex's review: one
+              // took the check away, and the thread was archived with its
+              // question unanswered).
+              if (endTurnWantsReply(ev)) {
+                this.doneCard = (needsFromTool(this.endTurnInputs.get(ev.itemId))?.needs ?? 'nothing') === 'nothing';
+                this.replyAfterEnd = '';
+              } else if (this.messageStands) this.doneCard = false;
               // Only an accepted call's own card: a refused repeat's result
               // isn't ok, and its questions never showed.
               if (endTurnWantsReply(ev)) this.owedReply = this.endTurnAsks.get(ev.itemId) ?? [];
             }
             else if (ev.type === 'assistant.text' && !ev.itemId.includes('/') && ev.text.trim()) {
-              if (this.pastEndTurn) this.wroteAfterEnd = true;
+              if (this.pastEndTurn) {
+                this.wroteAfterEnd = true;
+                this.replyAfterEnd = ev.text;
+              }
               this.owedReply = undefined;
             }
           }
@@ -755,6 +821,40 @@ class ClaudeSession implements AgentSession {
       this.resolveExit();
       this.sink.exited(error);
     }
+  }
+
+  // A message is the agent's to read from "started" (handed over with the
+  // next request to the model); "completed" and "cancelled" end it too.
+  // Only "queued" leaves it waiting. A turn's result names the messages it
+  // answered, for a CLI that folded several into one and reported on one.
+  private noteLifecycle(msg: Record<string, unknown>): void {
+    if (msg.parent_tool_use_id) return;
+    if (msg.type === 'result') {
+      const answered = [msg.user_message_uuid, ...(Array.isArray(msg.user_message_uuids) ? msg.user_message_uuids : [])];
+      for (const id of answered) if (typeof id === 'string') this.handedOver(id);
+      return;
+    }
+    if (msg.type !== 'command_lifecycle') return;
+    this.lifecycle = true;
+    if (msg.state !== 'queued' && typeof msg.command_uuid === 'string') this.handedOver(msg.command_uuid);
+  }
+
+  private handedOver(uuid: string): void {
+    this.notStarted.delete(uuid);
+  }
+
+  // Whether a message was sent that the agent can't have read: the call
+  // end_turn is handling was written before the CLI handed it over. Not
+  // known on a CLI that sends no lifecycle frames (before 2.1.310).
+  unreadMessage(): boolean {
+    if (!this.lifecycle) return false;
+    let unread = false;
+    for (const [id, refused] of this.notStarted) {
+      if (refused >= UNREAD_REFUSALS) continue;
+      this.notStarted.set(id, refused + 1);
+      unread = true;
+    }
+    return unread;
   }
 
   private markToolSeen(id: string): void {
@@ -785,7 +885,7 @@ class ClaudeSession implements AgentSession {
   private async canUseTool(
     name: string,
     input: Record<string, unknown>,
-    o: { signal: AbortSignal; suggestions?: PermissionUpdate[]; toolUseID: string; title?: string; suppressAlwaysAllowRule?: boolean; agentID?: string },
+    o: { signal: AbortSignal; suggestions?: PermissionUpdate[]; toolUseID: string; title?: string; suppressAlwaysAllowRule?: boolean; agentID?: string; decisionReason?: string; decisionReasonType?: string },
   ): Promise<PermissionResult> {
     // A subagent's tool calls stay inside its Agent call (the normaliser
     // drops them), so there's no tool.call to wait for or point at.
@@ -828,14 +928,16 @@ class ClaudeSession implements AgentSession {
     // the card says why (code-writes.ts).
     const target = EDIT_TOOLS.has(name) ? this.editTarget(input) : undefined;
     const code: CodeWrite = (target !== undefined && this.runsAsCode(target)) || this.codeWrites.has(o.toolUseID);
-    // The card shows the whole command, or every argument of an MCP tool
-    // (what it does elsewhere is in them); one too long for that is refused
-    // rather than allowed from its start (tools.ts, cardInput).
-    // An edit of a file that runs as code shows all it writes, too (Codex review).
-    const card = cardInput(input, name.startsWith('mcp__') || code ? 'all' : ['command']);
+    // The card shows the whole command, every argument of an MCP tool (what
+    // it does elsewhere is in them), and all an edit writes; one too long
+    // for that is refused rather than allowed from its start (tools.ts,
+    // cardDecisive and cardInput).
+    const card = cardInput(input, cardDecisive(name, code));
     if (card.tooLong) return { behavior: 'deny', message: tooLongForCard(card.tooLong), toolUseID: o.toolUseID };
     if (!sub) for (const out of this.normalizer.beforeApproval(o.toolUseID, name, input)) this.sink.output(out);
     const title = toolTitle(name, input, this.opts.cwd);
+    // A code write's title already says why it asks.
+    const reason = code ? undefined : askReason(o.decisionReason, o.decisionReasonType);
     // The rest of the reply's calls that will ask, on the same card.
     let waiting: WaitingCard | undefined;
     if (!sub && !plan) {
@@ -846,10 +948,12 @@ class ClaudeSession implements AgentSession {
     let ans: Awaited<ReturnType<SessionSink['requestApproval']>>;
     try {
       ans = await this.sink.requestApproval({
+        ...(reason ? { reason } : {}),
         toolUseId: itemId,
         name,
         title: code ? `${title} (${codeWriteNote(code)})` : title,
         input: card.input,
+        wholeInput: input,
         // "Always allow" would defeat a tool that's meant to ask every time.
         canAlwaysAllow: !plan && !code && !o.suppressAlwaysAllowRule && !this.deps.alwaysAsk?.has(name),
         signal: o.signal,
@@ -875,8 +979,8 @@ class ClaudeSession implements AgentSession {
         }
         return { behavior: 'allow', updatedInput: input, toolUseID: o.toolUseID, decisionClassification: 'user_temporary' };
       case 'allowAlways': {
-        const { updates, rules } = alwaysAllow(name, o.suggestions);
-        this.sink.output({ kind: 'allowRules', rules });
+        const { updates, rules } = alwaysAllow(name, o.suggestions, input);
+        if (rules.length) this.sink.output({ kind: 'allowRules', rules });
         return {
           behavior: 'allow',
           updatedInput: input,
@@ -923,6 +1027,11 @@ class ClaudeSession implements AgentSession {
       return { type: 'image', source: { type: 'base64', media_type: mediaType, data: data.toString('base64') } };
     });
     if (content.length === 0) content.push({ type: 'text', text: input.text });
+    const uuid = input.id ?? crypto.randomUUID();
+    // Not the agent's to read until the CLI says it has started on it. A
+    // frame that never comes mustn't keep them for ever.
+    this.notStarted.set(uuid, 0);
+    while (this.notStarted.size > 50) this.handedOver(this.notStarted.keys().next().value!);
     this.input.push({
       type: 'user',
       message: { role: 'user', content: content.length === 1 && content[0].type === 'text' ? input.text : (content as never) },
@@ -932,7 +1041,7 @@ class ClaudeSession implements AgentSession {
       origin: { kind: 'human' },
       // With a uuid the CLI reports command_lifecycle frames for the
       // message, which is how its own turns are told apart from this one.
-      uuid: input.id ?? crypto.randomUUID(),
+      uuid,
     } as SDKUserMessage);
   }
 
@@ -948,6 +1057,14 @@ class ClaudeSession implements AgentSession {
   async commands(): Promise<SlashCommand[]> {
     if (this.exited) return [];
     return claudeCommands(await this.q.supportedCommands(), { cwd: this.opts.cwd, configDir: this.opts.account.configDir });
+  }
+
+  // The /context breakdown. 'full' counts each row with the token-count
+  // API (about a second on a warm CLI, and no model turn), so the rows
+  // match what the CLI itself would say.
+  async contextUsage(): Promise<Omit<ContextUsage, 'at'> | undefined> {
+    if (this.exited) return undefined;
+    return claudeContextUsage(await this.q.getContextUsage({ detail: 'full' }));
   }
 
   async setModel(model: string | undefined): Promise<void> {
@@ -1005,6 +1122,24 @@ class ClaudeSession implements AgentSession {
   }
 }
 
+// getContextUsage's answer as the protocol's ContextUsage: the rows and
+// totals, without the grid, per-file and per-tool lists (about 50 KB on a
+// busy login) the popover doesn't show. A row that isn't a name and a
+// number is left out rather than failing the lot.
+export function claudeContextUsage(r: SDKControlGetContextUsageResponse): Omit<ContextUsage, 'at'> {
+  const categories: ContextUsage['categories'] = [];
+  for (const c of Array.isArray(r.categories) ? r.categories : []) {
+    if (typeof c?.name !== 'string' || typeof c.tokens !== 'number' || !Number.isFinite(c.tokens)) continue;
+    categories.push({ ...(typeof c.id === 'string' ? { id: c.id } : {}), name: c.name, tokens: c.tokens, kind: typeof c.kind === 'string' ? c.kind : c.isDeferred ? 'deferred' : 'used' });
+  }
+  return {
+    ...(typeof r.model === 'string' ? { model: r.model } : {}),
+    totalTokens: Number(r.totalTokens) || 0,
+    maxTokens: Number(r.maxTokens) || 0,
+    categories,
+  };
+}
+
 // The SDK's list, as the picker's. Claude Code's own are marked builtin;
 // the rest are Mike's or the folder's commands and skills. Rows can share
 // a name, and a builtin one is what /name runs, so that one is kept.
@@ -1027,6 +1162,7 @@ export function claudeCommands(
     if (plugin) out.plugin = plugin;
     const file = where && (scope === 'user' || scope === 'project') ? commandFile(name, scope === 'user' ? where.configDir : path.join(where.cwd, '.claude')) : undefined;
     if (file) out.path = file;
+    if (file && userOnlyFile(file)) out.userOnly = true;
     byName.set(name, out);
   }
   return [...byName.values()];
@@ -1048,6 +1184,28 @@ export function commandScope(description: string | undefined): { text?: string; 
   return { text: description };
 }
 
+// Why the CLI is asking, for the card: Auto's safety check handing the call
+// to Mike, a rule or a hook that asks. Not the mode itself, which every card
+// in Ask before edits would say. David, 8 Nov 2026: a deploy's card gave no
+// reason, and he couldn't tell what the check had balked at.
+export function askReason(reason: string | undefined, type: string | undefined): string | undefined {
+  const text = typeof reason === 'string' ? reason.trim().slice(0, 1000) : '';
+  if (!text || type === 'mode') return undefined;
+  return type === 'classifier' ? `Auto mode's safety check couldn't clear this: ${text}` : text;
+}
+
+// A skill or command whose frontmatter says `disable-model-invocation:
+// true`: the agent can't run it, so it works only at the start of a
+// message, not named partway through one (claude -p, 9 Nov 2026).
+export function userOnlyFile(file: string): boolean {
+  try {
+    const yaml = frontmatter(fs.readFileSync(file, 'utf8'));
+    return yaml !== undefined && /^disable-model-invocation[ \t]*:[ \t]*["']?true["']?[ \t]*(#.*)?$/m.test(yaml);
+  } catch {
+    return false;
+  }
+}
+
 // A user or project command's file: its skill, else its command (a ":"
 // in the name is a folder, as the CLI reads them).
 export function commandFile(name: string, base: string): string | undefined {
@@ -1061,22 +1219,56 @@ export function commandFile(name: string, base: string): string | undefined {
 // would change more than the user agreed to and outlive the thread, so
 // those are dropped and every rule is session-scoped. The runner keeps the
 // rules on the thread and passes them back as allowedTools after a resume.
-export function alwaysAllow(name: string, suggestions: PermissionUpdate[] | undefined): { updates: PermissionUpdate[]; rules: string[] } {
+//
+// tb gets one rule for exactly the command that was allowed, and never the
+// CLI's suggested prefix (docs/protocol.md, "A thread's own key"): allowing
+// `tb new --ask x` shouldn't allow `tb new --full y` the next time.
+export function alwaysAllow(name: string, suggestions: PermissionUpdate[] | undefined, input?: Record<string, unknown>): { updates: PermissionUpdate[]; rules: string[] } {
   const updates: PermissionUpdate[] = [];
   const rules: string[] = [];
+  const command = name === 'Bash' && typeof input?.command === 'string' ? input.command : undefined;
+  const isTb = command !== undefined && mentionsTb(command);
   for (const s of suggestions ?? []) {
     if (s.type === 'addRules' && s.behavior === 'allow' && s.rules.length) {
-      updates.push({ ...s, destination: 'session' });
-      rules.push(...s.rules.map(ruleString));
+      const kept = isTb ? s.rules.filter((r) => r.toolName !== 'Bash') : s.rules;
+      if (kept.length) {
+        updates.push({ ...s, rules: kept, destination: 'session' });
+        rules.push(...kept.map(ruleString));
+      }
     } else if (s.type === 'addDirectories') {
       updates.push({ ...s, destination: 'session' });
     }
+  }
+  if (name === 'Bash') {
+    // Exact, or none: a `*` in a rule is a wildcard and a newline can't go
+    // in one, so that command is allowed this once, like Codex's are.
+    if (isTb || rules.length === 0) {
+      if (command !== undefined && !/[*\n\r]/.test(command)) {
+        const rule = { toolName: 'Bash', ruleContent: command };
+        updates.push({ type: 'addRules', rules: [rule], behavior: 'allow', destination: 'session' });
+        rules.push(ruleString(rule));
+      }
+    }
+    return { updates, rules };
   }
   if (rules.length === 0) {
     updates.push({ type: 'addRules', rules: [{ toolName: name }], behavior: 'allow', destination: 'session' });
     rules.push(name);
   }
   return { updates, rules };
+}
+
+// Whether a shell command runs tb anywhere in it: alone, by path, quoted, or
+// behind && or a pipe.
+export function mentionsTb(command: string): boolean {
+  // Quotes and backslashes don't change what runs: t'b', \\tb, t\\<newline>b.
+  return /(^|[\s;&|()`$=/])tb(\s|$|[;&|)`])/.test(command.replace(/\\\n/g, '').replace(/[\\'"]/g, ''));
+}
+
+// A saved "Always allow" prefix rule for tb, from before they were exact.
+export function isTbPrefixRule(rule: string): boolean {
+  const m = /^Bash\((.*)\)$/s.exec(rule);
+  return Boolean(m && /\*/.test(m[1]) && mentionsTb(m[1].replace(/\*/g, ' ').replace(/:/g, ' ')));
 }
 
 function ruleString(r: { toolName: string; ruleContent?: string }): string {

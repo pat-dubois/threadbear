@@ -26,7 +26,7 @@ final class RunnerAuthTests: XCTestCase {
         XCTAssertNil(RunnerAuth.loopbackPort(URL(string: "wss://bruce.example.ts.net/rpc")!))
         // A challenge passed on from a runner on 9001 says 9001; a client that
         // dialed 8797 binds its proof to 8797 all the same, so the runner on
-        // 9001 turns it down. Another Mac's runner is taken at its word.
+        // 9001 turns it down. A runner on any other host is taken at its word.
         let challenge = Data(#"{"method":"auth.challenge","params":{"nonce":"\#(String(repeating: "a", count: 64))","port":9001}}"#.utf8)
         let clientNonce = String(repeating: "0123456789abcdef", count: 4)
         let local = try RunnerAuth.answer(challenge: challenge, token: token, dialedPort: 8797, clientNonce: clientNonce)
@@ -88,9 +88,11 @@ final class RunnerAuthTests: XCTestCase {
         guard FileManager.default.fileExists(atPath: Self.mockDir.appendingPathComponent("node_modules/ws").path) else {
             throw try missing("Tools/mock-runner has no node_modules; run npm install there")
         }
-        let paths = (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":").map(String.init)
-            + [NSHomeDirectory() + "/.nvm/versions/node/v24.22.1/bin", "/opt/homebrew/bin", "/usr/local/bin"]
-        guard let node = paths.map({ $0 + "/node" }).first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+        // check.sh's Node (THREADBEAR_NODE) first, then PATH and Homebrew's.
+        let env = ProcessInfo.processInfo.environment
+        let nodes = [env["THREADBEAR_NODE"]].compactMap { $0 }
+            + ((env["PATH"] ?? "").split(separator: ":").map(String.init) + ["/opt/homebrew/bin", "/usr/local/bin"]).map { $0 + "/node" }
+        guard let node = nodes.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
             throw try missing("node isn't on PATH")
         }
         return node
